@@ -178,8 +178,9 @@ app.get('/api/fixtures', async (req, res) => {
     const months   = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
 
     if (cfg.api === 'football') {
+      const nextWeek2 = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
       const r = await axios.get('https://v3.football.api-sports.io/fixtures', {
-        headers, params: { league: cfg.id, season, from: today, to: nextWeek, status: 'NS' }
+        headers, params: { league: cfg.id, season, from: today, to: nextWeek2, status: 'NS' }
       });
       return res.json((r.data.response || []).slice(0, 10).map((f, i) => {
         const d = new Date(f.fixture.date);
