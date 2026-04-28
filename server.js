@@ -191,14 +191,21 @@ app.get('/api/fixtures', async (req, res) => {
       }));
     }
     if (cfg.api === 'basketball') {
-      const r = await axios.get('https://v1.basketball.api-sports.io/games', {
-        headers, params: { league: cfg.id, season: `${season}-${season+1}`, date: today }
-      });
-      return res.json((r.data.response || []).slice(0, 10).map((g, i) => ({
-        id: i+1, home: g.teams?.home?.name || '', away: g.teams?.visitors?.name || '',
-        time: new Date(g.date?.start || g.date).toLocaleString('es-MX', { weekday:'short', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' }),
-        venue: g.arena?.name || ''
-      })));
+      let games = [];
+      for(let dd=0; dd<=7; dd++){
+        const searchDay = new Date(Date.now()+dd*86400000).toISOString().split('T')[0];
+        const r = await axios.get('https://v1.basketball.api-sports.io/games', {
+          headers, params: { league: cfg.id, season: `${season}-${season+1}`, date: searchDay }
+        });
+        games = r.data.response || [];
+        if(games.length > 0) break;
+      }
+      return res.json(games.slice(0, 10).map((g, i) => {
+        const d = new Date(g.date?.start || g.date);
+        return { id: i+1, home: g.teams?.home?.name || '', away: g.teams?.visitors?.name || '',
+          time: days[d.getDay()]+' '+d.getDate()+' '+months[d.getMonth()]+' - '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'),
+          venue: g.arena?.name || '' };
+      }));
     }
     if (cfg.api === 'baseball') {
       const r = await axios.get('https://v1.baseball.api-sports.io/games', {
