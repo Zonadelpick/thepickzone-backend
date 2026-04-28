@@ -324,7 +324,7 @@ app.listen(PORT, () => {
 });
 
 // ── STRIPE PAYMENTS ───────────────────────────────────────────────────────────
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY3ds300uIdXlCrH');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Charge card via Stripe
 app.post('/api/payments/charge', auth, async (req, res) => {
