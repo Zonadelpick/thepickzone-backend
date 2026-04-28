@@ -13,7 +13,7 @@ app.use(express.json({ limit: '10mb' }));
 const PORT           = process.env.PORT           || 3001;
 const MONGO_URI      = process.env.MONGO_URI      || '';
 const JWT_SECRET     = process.env.JWT_SECRET     || 'thepickzone_secret_2026';
-const API_SPORTS_KEY = process.env.API_SPORTS_KEY || '19d25c121dc39cafff60ca07c2511171';
+const API_SPORTS_KEY = process.env.API_SPORTS_KEY || '6e223c4a4618a8df2d8cd3ea63248740';
 
 if (MONGO_URI) {
   mongoose.connect(MONGO_URI)
