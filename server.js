@@ -179,6 +179,11 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user) return res.status(400).json({ error: 'Email o contrasena incorrectos' });
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(400).json({ error: 'Email o contrasena incorrectos' });
+    // Check if Pro subscription expired
+    if(user.role === 'pro' && user.proExpiry && new Date() > user.proExpiry){
+      await User.findByIdAndUpdate(user._id, { role: 'basic' });
+      user.role = 'basic';
+    }
     const token = jwt.sign({ id: user._id, email: user.email, role: user.role, name: user.name, roi: user.roi }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token, user: { id: user._id, name: user.name, email: user.email, role: user.role, roi: user.roi, balance: user.balance } });
   } catch (err) { res.status(500).json({ error: err.message }); }
