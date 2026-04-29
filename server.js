@@ -326,6 +326,49 @@ app.put('/api/admin/users/:id/role', auth, requireAdmin, async (req, res) => {
 });
 
 app.get('/api/fixtures/team', async (req, res) => { const { team } = req.query; if (!team) return res.status(400).json({ error: 'Equipo requerido' }); const headers = { 'x-apisports-key': API_SPORTS_KEY }; const days = ['Dom','Lun','Mar','Mie','Jue','Vie','Sab']; const months = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic']; const fmt = d => { const dt=new Date(d); return String(dt.getFullYear()).length<4?null:days[dt.getDay()]+' '+dt.getDate()+' '+months[dt.getMonth()]+' - '+String(dt.getHours()).padStart(2,'0')+':'+String(dt.getMinutes()).padStart(2,'0'); }; const today = new Date().toISOString().split('T')[0]; const season = new Date().getFullYear(); const results = []; try { const nba = await axios.get('https://v1.basketball.api-sports.io/games', { headers, params: { league:12, season:season+'-'+(season+1), date:today } }); (nba.data.response||[]).forEach(g => { const h=(g.teams?.home?.name||'').toLowerCase(),a=(g.teams?.visitors?.name||'').toLowerCase(),t=team.toLowerCase(); if(h.includes(t)||a.includes(t)) results.push({ home:g.teams.home.name, away:g.teams.visitors.name, league:'NBA '+season, time:fmt(g.date?.start||g.date)||today, venue:g.arena?.name||'' }); }); const mlb = await axios.get('https://v1.baseball.api-sports.io/games', { headers, params: { league:1, season, date:today } }); (mlb.data.response||[]).forEach(g => { const h=(g.teams?.home?.name||'').toLowerCase(),a=(g.teams?.away?.name||'').toLowerCase(),t=team.toLowerCase(); if(h.includes(t)||a.includes(t)) results.push({ home:g.teams.home.name, away:g.teams.away.name, league:'MLB '+season, time:fmt(g.date)||today, venue:g.venue?.name||'' }); }); const nhl = await axios.get('https://v1.hockey.api-sports.io/games', { headers, params: { league:57, season:season+'-'+(season+1), date:today } }); (nhl.data.response||[]).forEach(g => { const h=(g.teams?.home?.name||'').toLowerCase(),a=(g.teams?.away?.name||'').toLowerCase(),t=team.toLowerCase(); if(h.includes(t)||a.includes(t)) results.push({ home:g.teams.home.name, away:g.teams.away.name, league:'NHL '+season, time:fmt(g.date)||today, venue:g.arena||'' }); }); if(results.length===0) return res.json([{ notFound:true }]); res.json(results); } catch(err) { console.error('team search error:',err.message); res.status(500).json({ error: err.message }); }});
+
+app.get('/api/fixtures/espn', async (req, res) => {
+  const { league } = req.query;
+  if(!league) return res.status(400).json({ error: 'liga requerida' });
+  const ESPN_MAP = {
+    'NBA':  'basketball/nba',
+    'MLB':  'baseball/mlb',
+    'NHL':  'hockey/nhl',
+    'NFL':  'football/nfl',
+    'MLS':  'soccer/usa.1',
+    'UFC':  'mma/ufc',
+  };
+  const path = ESPN_MAP[league];
+  if(!path) return res.json([]);
+  try {
+    const days = ['Dom','Lun','Mar','Mie','Jue','Vie','Sab'];
+    const months = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
+    const r = await axios.get('https://site.api.espn.com/apis/site/v2/sports/'+path+'/scoreboard');
+    const events = r.data.events || [];
+    const results = events.filter(e => {
+      const status = e.status?.type?.state;
+      return status === 'pre';
+    }).slice(0, 10).map((e, i) => {
+      const d = new Date(e.date);
+      const comps = e.competitions?.[0];
+      const home = comps?.competitors?.find(t => t.homeAway === 'home');
+      const away = comps?.competitors?.find(t => t.homeAway === 'away');
+      return {
+        id: i+1,
+        home: home?.team?.displayName || '',
+        away: away?.team?.displayName || '',
+        time: days[d.getDay()]+' '+d.getDate()+' '+months[d.getMonth()]+' - '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'),
+        venue: comps?.venue?.fullName || ''
+      };
+    });
+    if(results.length === 0) return res.json([{notFound: true}]);
+    res.json(results);
+  } catch(err) {
+    console.error('ESPN error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log('ThePickZone Backend corriendo en puerto ' + PORT);
   console.log('API-Sports key: ' + API_SPORTS_KEY.substring(0,8) + '...');
