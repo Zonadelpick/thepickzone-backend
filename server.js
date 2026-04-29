@@ -472,6 +472,32 @@ app.post('/api/paypal/capture-order', auth, async (req, res) => {
   }
 });
 
+
+// Reset all pro users stats
+app.post('/api/admin/reset-stats', auth, requireAdmin, async (req, res) => {
+  try {
+    await User.updateMany({ role: 'pro' }, { roi: '+0%', balance: 0 });
+    await Pick.updateMany({}, { result: 'pending', buyers: [] });
+    res.json({ success: true, message: 'Stats reseteados' });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get pending result picks for admin
+app.get('/api/admin/picks-pending', auth, requireAdmin, async (req, res) => {
+  try {
+    const picks = await Pick.find({ result: 'pending' }).sort({ createdAt: -1 });
+    res.json(picks);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get all picks for admin
+app.get('/api/admin/picks-all', auth, requireAdmin, async (req, res) => {
+  try {
+    const picks = await Pick.find().sort({ createdAt: -1 }).select('-ticketImg');
+    res.json(picks);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log('ThePickZone Backend corriendo en puerto ' + PORT);
   console.log('API-Sports key: ' + API_SPORTS_KEY.substring(0,8) + '...');
