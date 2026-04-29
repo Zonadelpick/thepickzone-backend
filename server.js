@@ -47,6 +47,7 @@ const PickSchema = new mongoose.Schema({
   locked:    { type: Boolean, default: true },
   result:    { type: String, enum: ['pending','won','lost'], default: 'pending' },
   buyers:    [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  aiAnalysis:{ type: Object, default: null },
   createdAt: { type: Date, default: Date.now },
 });
 
