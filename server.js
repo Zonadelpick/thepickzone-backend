@@ -201,16 +201,19 @@ app.get('/api/fixtures', async (req, res) => {
 
     if (cfg.api === 'football') {
       const nextWeek2 = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
-      const r = await axios.get('https://v3.football.api-sports.io/fixtures', {
-        headers, params: { league: cfg.id, season, from: today, to: nextWeek2, status: 'NS' }
+      let r = await axios.get('https://v3.football.api-sports.io/fixtures', {
+        headers, params: { league: cfg.id, season: 2025, from: today, to: nextWeek2, status: 'NS' }
       });
+      if((r.data.response||[]).length === 0){
+        r = await axios.get('https://v3.football.api-sports.io/fixtures', {
+          headers, params: { league: cfg.id, season: 2026, from: today, to: nextWeek2, status: 'NS' }
+        });
+      }
       return res.json((r.data.response || []).slice(0, 10).map((f, i) => {
         const d = new Date(f.fixture.date);
-        return {
-          id: i+1, home: f.teams.home.name, away: f.teams.away.name,
-          time: `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]} - ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`,
-          venue: f.fixture.venue?.name || ''
-        };
+        return { id: i+1, home: f.teams.home.name, away: f.teams.away.name,
+          time: days[d.getDay()]+' '+d.getDate()+' '+months[d.getMonth()]+' - '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'),
+          venue: f.fixture.venue?.name || '' };
       }));
     }
     if (cfg.api === 'basketball') {
