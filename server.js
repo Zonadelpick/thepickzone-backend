@@ -415,6 +415,57 @@ app.get('/api/fixtures/espn', async (req, res) => {
   }
 });
 
+
+// PayPal
+const paypal = require('@paypal/checkout-server-sdk');
+const paypalEnv = new paypal.core.LiveEnvironment(
+  'AfC5IdhZr9ZgD94g2Rszgj8rwgM8o1R9j2bdsn-rOfvshjKp-jEqPiMKt057mJdfdSK8czay2muw3MB0',
+  'EJt_u3ogXQRY87ZWBZ5wStvKy7HZI8V5BL355vHgpNX1DTBrd3znqSisCIeOjT85rdxi3uG0BSV1GPZL'
+);
+const paypalClient = new paypal.core.PayPalHttpClient(paypalEnv);
+
+app.post('/api/paypal/create-order', auth, async (req, res) => {
+  try {
+    const { amount, description } = req.body;
+    const request = new paypal.orders.OrdersCreateRequest();
+    request.prefer('return=representation');
+    request.requestBody({
+      intent: 'CAPTURE',
+      purchase_units: [{
+        amount: { currency_code: 'USD', value: String(amount) },
+        description: description || 'ThePickZone Pro'
+      }]
+    });
+    const order = await paypalClient.execute(request);
+    res.json({ orderId: order.result.id });
+  } catch(err) {
+    console.error('PayPal create order error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/paypal/capture-order', auth, async (req, res) => {
+  try {
+    const { orderId, plan } = req.body;
+    const request = new paypal.orders.OrdersCaptureRequest(orderId);
+    request.requestBody({});
+    const capture = await paypalClient.execute(request);
+    if(capture.result.status === 'COMPLETED'){
+      // Activate Pro
+      await User.findByIdAndUpdate(req.user.id, {
+        role: 'pro',
+        proExpiry: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+      });
+      res.json({ success: true, status: 'COMPLETED' });
+    } else {
+      res.status(400).json({ error: 'Pago no completado', status: capture.result.status });
+    }
+  } catch(err) {
+    console.error('PayPal capture error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log('ThePickZone Backend corriendo en puerto ' + PORT);
   console.log('API-Sports key: ' + API_SPORTS_KEY.substring(0,8) + '...');
