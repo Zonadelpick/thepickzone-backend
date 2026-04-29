@@ -194,7 +194,7 @@ app.get('/api/fixtures', async (req, res) => {
   try {
     const today    = new Date().toISOString().split('T')[0];
     const nextWeek = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
-    const season   = new Date().getMonth() >= 6 ? new Date().getFullYear() : new Date().getFullYear() - 1;
+    const season   = 2025;
     const headers  = { 'x-apisports-key': API_SPORTS_KEY };
     const days     = ['Dom','Lun','Mar','Mie','Jue','Vie','Sab'];
     const months   = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
