@@ -376,7 +376,20 @@ app.get('/api/fixtures/espn', async (req, res) => {
   try {
     const days = ['Dom','Lun','Mar','Mie','Jue','Vie','Sab'];
     const months = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
-    const r = await axios.get('https://site.api.espn.com/apis/site/v2/sports/'+path+'/scoreboard');
+    // Build dates for next 7 days
+    const espnDates = [];
+    for(let d=0; d<=7; d++){
+      const dt = new Date(Date.now()+d*86400000);
+      const ds = dt.getFullYear().toString()+String(dt.getMonth()+1).padStart(2,'0')+String(dt.getDate()).padStart(2,'0');
+      espnDates.push(ds);
+    }
+    const allEvents = [];
+    for(const dateStr of espnDates){
+      const r = await axios.get('https://site.api.espn.com/apis/site/v2/sports/'+path+'/scoreboard?dates='+dateStr);
+      (r.data.events||[]).forEach(e => allEvents.push(e));
+      if(allEvents.filter(e=>e.status?.type?.state==='pre').length >= 10) break;
+    }
+    const r = { data: { events: allEvents } };
     const events = r.data.events || [];
     const results = events.filter(e => {
       const status = e.status?.type?.state;
