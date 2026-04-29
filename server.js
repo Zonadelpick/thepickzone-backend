@@ -331,6 +331,10 @@ app.get('/api/fixtures/espn', async (req, res) => {
   const { league } = req.query;
   if(!league) return res.status(400).json({ error: 'liga requerida' });
   const ESPN_MAP = {
+    'Formula 1': 'racing/f1',
+    'UFC': 'mma/ufc',
+    'NCAA Football': 'football/college-football',
+    'NCAA Basketball': 'basketball/mens-college-basketball',
     'NBA':  'basketball/nba',
     'MLB':  'baseball/mlb',
     'NHL':  'hockey/nhl',
