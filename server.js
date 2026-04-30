@@ -564,10 +564,12 @@ async function analyzePickResult(pick) {
     let aiResult = 'pending';
     if(pick.ticketImg){
       const prompt = 'Eres un experto en apuestas deportivas. El partido '+pick.match+' termino con marcador '+result.homeScore+'-'+result.awayScore+' ('+result.home+' vs '+result.away+'). Analiza esta imagen del ticket de apuesta y determina si la apuesta fue GANADA o PERDIDA. Responde SOLO con JSON: {"resultado":"GANADO" o "PERDIDO" o "VOID","confianza":0-100,"detalle":"explicacion breve"}';
+      console.log('Calling Claude with image size:', pick.ticketImg?.length);
+      const imgData = pick.ticketImg.includes(',') ? pick.ticketImg.split(',')[1] : pick.ticketImg;
       const analyzeRes = await axios_cron.post('https://api.anthropic.com/v1/messages', {
         model: 'claude-sonnet-4-20250514', max_tokens: 500,
         messages: [{ role: 'user', content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: pick.ticketImg.split(',')[1]||pick.ticketImg }},
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imgData }},
           { type: 'text', text: prompt }
         ]}]
       }, { headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' }});
