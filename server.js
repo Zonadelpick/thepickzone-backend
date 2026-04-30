@@ -583,7 +583,9 @@ async function analyzePickResult(pick) {
 async function runPickAnalysis() {
   try {
     const now = new Date();
+    console.log('runPickAnalysis started, time:', now);
     const picks = await Pick.find({ result: 'pending', ticketImg: { $exists: true } });
+    console.log('Found picks:', picks.length);
     for(const pick of picks){
       // Parse pick time to check if match has ended (assume 3 hours after start)
       const timeStr = pick.time;
@@ -595,6 +597,7 @@ async function runPickAnalysis() {
       if(month===undefined) continue;
       const matchTime = new Date(now.getFullYear(), month, parseInt(p[1]), parseInt(p[3]), parseInt(p[4]));
       const endTime = new Date(matchTime.getTime() + 3*60*60*1000);
+      console.log('Pick:', pick.match, '| time:', pick.time, '| ended:', now > endTime);
       if(now > endTime){
         await analyzePickResult(pick);
       }
