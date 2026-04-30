@@ -551,7 +551,12 @@ async function analyzePickResult(pick) {
     const homeTeam = matchParts[0].trim();
     const awayTeam = matchParts[1].trim();
     
-    const result = await getMatchResult(pick.league, homeTeam, awayTeam, new Date());
+    // Parse match date from pick.time
+    const mo2 = {Ene:0,Feb:1,Mar:2,Abr:3,May:4,Jun:5,Jul:6,Ago:7,Sep:8,Oct:9,Nov:10,Dic:11};
+    const tp = pick.time?.match(/(\d{1,2})\s+(\w+)\s+-\s+(\d{2}):(\d{2})/);
+    const matchDate = tp ? new Date(new Date().getFullYear(), mo2[tp[2]]||0, parseInt(tp[1])) : new Date();
+    console.log('Searching ESPN for date:', matchDate.toISOString().split('T')[0]);
+    const result = await getMatchResult(pick.league, homeTeam, awayTeam, matchDate);
     console.log('ESPN result:', JSON.stringify(result));
     if(!result || !result.completed){ console.log('No result found for:', pick.match); return; }
     
