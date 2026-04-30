@@ -545,13 +545,15 @@ async function getMatchResult(league, homeTeam, awayTeam, matchDate) {
 
 async function analyzePickResult(pick) {
   try {
+    console.log('analyzePickResult started:', pick.match);
     const matchParts = pick.match.split(' vs ');
     if(matchParts.length < 2) return;
     const homeTeam = matchParts[0].trim();
     const awayTeam = matchParts[1].trim();
     
     const result = await getMatchResult(pick.league, homeTeam, awayTeam, new Date());
-    if(!result || !result.completed) return;
+    console.log('ESPN result:', JSON.stringify(result));
+    if(!result || !result.completed){ console.log('No result found for:', pick.match); return; }
     
     // Use Claude to analyze ticket image vs result
     let aiResult = 'pending';
