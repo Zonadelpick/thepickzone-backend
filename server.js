@@ -154,6 +154,16 @@ const SPORT_CONFIG = {
   'UFC':                        { api: 'mma',        id: 1   },
 };
 
+app.post('/api/admin/set-role', async (req, res) => {
+  const { secret, email, role } = req.body;
+  if(secret !== 'tpz-setup-2026') return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const user = await User.findOneAndUpdate({ email }, { role }, { new: true });
+    if(user) res.json({ success: true, email: user.email, role: user.role });
+    else res.json({ error: 'User not found' });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'ThePickZone API funcionando v1.0' });
 });
