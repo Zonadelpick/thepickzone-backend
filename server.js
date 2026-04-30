@@ -585,7 +585,7 @@ async function analyzePickResult(pick) {
       // No ticket image - just mark as needing manual review
       await Pick.findByIdAndUpdate(pick._id, { aiAnalysis: { resultado: 'SIN TICKET', detalle: result.homeScore+'-'+result.awayScore, confianza: 0 }});
     }
-  } catch(e){ console.error('analyzePickResult error:', e.message); }
+  } catch(e){ console.error('analyzePickResult error:', e.message, e.response?.data ? JSON.stringify(e.response.data).substring(0,300) : ''); }
 }
 
 // Auto-analyze picks every hour
