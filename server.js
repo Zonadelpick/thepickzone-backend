@@ -629,6 +629,49 @@ app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
 
+
+const ODDS_API_KEY = process.env.ODDS_API_KEY;
+const ODDS_SPORT_KEYS = {
+  'NBA': 'basketball_nba',
+  'MLB': 'baseball_mlb',
+  'NHL': 'icehockey_nhl',
+  'NFL': 'americanfootball_nfl',
+  'MLS': 'soccer_usa_mls',
+  'Liga MX': 'soccer_mexico_ligamx',
+  'Premier League': 'soccer_epl',
+  'Champions League': 'soccer_uefa_champs_league',
+  'Liga de Espana': 'soccer_spain_la_liga',
+  'Bundesliga': 'soccer_germany_bundesliga',
+  'Serie A': 'soccer_italy_serie_a',
+  'Ligue 1': 'soccer_france_ligue_one'
+};
+
+async function getScoreFromOddsAPI(league, homeTeam, awayTeam) {
+  try {
+    const sportKey = ODDS_SPORT_KEYS[league];
+    if(!sportKey) { console.log('No odds key for league:', league); return null; }
+    const url = 'https://api.the-odds-api.com/v4/sports/'+sportKey+'/scores/?apiKey='+ODDS_API_KEY+'&daysFrom=3&dateFormat=iso';
+    const r = await axios.get(url);
+    const games = r.data || [];
+    console.log('Odds API games found:', games.length, 'for', league);
+    for(const g of games){
+      const hn = (g.home_team||'').toLowerCase();
+      const an = (g.away_team||'').toLowerCase();
+      const h0 = homeTeam.toLowerCase();
+      const a0 = awayTeam.toLowerCase();
+      const homeMatch = hn.includes(h0.split(' ')[0]) || h0.includes(hn.split(' ')[0]);
+      const awayMatch = an.includes(a0.split(' ')[0]) || a0.includes(an.split(' ')[0]);
+      if(homeMatch && awayMatch && g.completed){
+        const homeScore = g.scores?.find(s=>s.name===g.home_team)?.score || '?';
+        const awayScore = g.scores?.find(s=>s.name===g.away_team)?.score || '?';
+        console.log('Odds API result:', g.home_team, homeScore, '-', awayScore, g.away_team);
+        return { home: g.home_team, away: g.away_team, homeScore, awayScore, completed: true };
+      }
+    }
+    return null;
+  } catch(e) { console.error('Odds API error:', e.message); return null; }
+}
+
 const GOOGLE_VISION_KEY = process.env.GOOGLE_VISION_KEY;
 
 async function extractTicketText(base64Image) {
