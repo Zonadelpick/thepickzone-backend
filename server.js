@@ -673,9 +673,9 @@ async function getScoreFromOddsAPI(league, homeTeam, awayTeam) {
 }
 
 
-const ODDS_API_KEY = process.env.ODDS_API_KEY;
-const ANTHROPIC_KEY2 = process.env.ANTHROPIC_API_KEY;
-const GOOGLE_VISION_KEY2 = process.env.GOOGLE_VISION_KEY;
+
+
+
 
 const ODDS_SPORT_KEYS = {
   'NBA':'basketball_nba','MLB':'baseball_mlb','NHL':'icehockey_nhl',
