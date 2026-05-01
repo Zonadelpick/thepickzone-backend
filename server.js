@@ -567,7 +567,7 @@ async function analyzePickResult(pick) {
       console.log('Calling Claude with image size:', pick.ticketImg?.length);
       const imgData = pick.ticketImg.includes(',') ? pick.ticketImg.split(',')[1] : pick.ticketImg;
       const analyzeRes = await axios_cron.post('https://api.anthropic.com/v1/messages', {
-        model: 'claude-sonnet-4-20250514', max_tokens: 500,
+        model: 'claude-haiku-4-5-20251001', max_tokens: 500,
         messages: [{ role: 'user', content: [
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imgData }},
           { type: 'text', text: prompt }
@@ -635,7 +635,7 @@ async function analyzePickWithClaude(pick, espnResult) {
     const imgMime = pick.ticketImg.includes('data:image/png') ? 'image/png' : 'image/jpeg';
     const prompt = 'Partido: '+pick.match+'. Resultado ESPN: '+espnResult.home+' '+espnResult.homeScore+' - '+espnResult.awayScore+' '+espnResult.away+'. Analiza el ticket de apuesta y determina si GANO o PERDIO. Responde SOLO con JSON: {"resultado":"GANADO" o "PERDIDO" o "VOID","confianza":0-100,"detalle":"explicacion breve"}';
     const res = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 300,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: imgMime, data: imgData }},
