@@ -582,100 +582,10 @@ async function analyzePickResult(pick) {
         console.log('Pick analyzed:', pick.match, '->', aiResult);
       }
     } else {
-      // No ticket image - just mark as needing manual review
-      await Pick.findByIdAndUpdate(pick._id, { aiAnalysis: { resultado: 'SIN TICKET', detalle: result.homeScore+'-'+result.awayScore, confianza: 0 }});
-    }
-  } catch(e){ console.error('analyzePickResult error:', e.message, e.response?.data ? JSON.stringify(e.response.data).substring(0,300) : ''); }
-}
-
-// Auto-analyze picks every hour
-async function runPickAnalysis() {
-  try {
-    const now = new Date();
-    console.log('runPickAnalysis started, time:', now);
-    const picks = await Pick.find({ result: 'pending', ticketImg: { $exists: true } });
-    console.log('Found picks:', picks.length);
-    for(const pick of picks){
-      // Parse pick time to check if match has ended (assume 3 hours after start)
-      const timeStr = pick.time;
-      if(!timeStr) continue;
-      const mo = {Ene:0,Feb:1,Mar:2,Abr:3,May:4,Jun:5,Jul:6,Ago:7,Sep:8,Oct:9,Nov:10,Dic:11};
-      const p = timeStr.match(/(\d{1,2})\s+(\w+)\s+-\s+(\d{2}):(\d{2})/);
-      if(!p) continue;
-      const month = mo[p[2]];
-      if(month===undefined) continue;
-      const matchTime = new Date(now.getFullYear(), month, parseInt(p[1]), parseInt(p[3]), parseInt(p[4]));
-      const endTime = new Date(matchTime.getTime() + 3*60*60*1000);
-      console.log('Pick:', pick.match, '| time:', pick.time, '| ended:', now > endTime);
-      if(now > endTime){
-        await analyzePickResult(pick);
-      }
-    }
-  } catch(e){ console.error('runPickAnalysis error:', e.message); }
-}
-
-// Run every hour
-setInterval(runPickAnalysis, 60*60*1000);
-// Also run on startup after 5 minutes
-setTimeout(runPickAnalysis, 5*60*1000);
-
-// Manual trigger endpoint for admin
-app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
-  runPickAnalysis();
-  res.json({ success: true, message: 'Analisis iniciado' });
-});
-
-
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-
-
 
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
-const ODDS_SPORT_KEYS = {
-  'NBA': 'basketball_nba',
-  'MLB': 'baseball_mlb',
-  'NHL': 'icehockey_nhl',
-  'NFL': 'americanfootball_nfl',
-  'MLS': 'soccer_usa_mls',
-  'Liga MX': 'soccer_mexico_ligamx',
-  'Premier League': 'soccer_epl',
-  'Champions League': 'soccer_uefa_champs_league',
-  'Liga de Espana': 'soccer_spain_la_liga',
-  'Bundesliga': 'soccer_germany_bundesliga',
-  'Serie A': 'soccer_italy_serie_a',
-  'Ligue 1': 'soccer_france_ligue_one'
-};
-
-async function getScoreFromOddsAPI(league, homeTeam, awayTeam) {
-  try {
-    const sportKey = ODDS_SPORT_KEYS[league];
-    if(!sportKey) { console.log('No odds key for league:', league); return null; }
-    const url = 'https://api.the-odds-api.com/v4/sports/'+sportKey+'/scores/?apiKey='+ODDS_API_KEY+'&daysFrom=3&dateFormat=iso';
-    const r = await axios.get(url);
-    const games = r.data || [];
-    console.log('Odds API games found:', games.length, 'for', league);
-    for(const g of games){
-      const hn = (g.home_team||'').toLowerCase();
-      const an = (g.away_team||'').toLowerCase();
-      const h0 = homeTeam.toLowerCase();
-      const a0 = awayTeam.toLowerCase();
-      const homeMatch = hn.includes(h0.split(' ')[0]) || h0.includes(hn.split(' ')[0]);
-      const awayMatch = an.includes(a0.split(' ')[0]) || a0.includes(an.split(' ')[0]);
-      if(homeMatch && awayMatch && g.completed){
-        const homeScore = g.scores?.find(s=>s.name===g.home_team)?.score || '?';
-        const awayScore = g.scores?.find(s=>s.name===g.away_team)?.score || '?';
-        console.log('Odds API result:', g.home_team, homeScore, '-', awayScore, g.away_team);
-        return { home: g.home_team, away: g.away_team, homeScore, awayScore, completed: true };
-      }
-    }
-    return null;
-  } catch(e) { console.error('Odds API error:', e.message); return null; }
-}
-
-
-
-
-
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const GOOGLE_VISION_KEY = process.env.GOOGLE_VISION_KEY;
 
 const ODDS_SPORT_KEYS = {
   'NBA':'basketball_nba','MLB':'baseball_mlb','NHL':'icehockey_nhl',
@@ -696,17 +606,15 @@ async function getMatchScore(league, homeTeam, awayTeam) {
     for(const g of games){
       if(!g.completed) continue;
       const hn = (g.home_team||'').toLowerCase();
-      const an = (g.away_team||'').toLowerCase();
       const h0 = homeTeam.toLowerCase().split(' ')[0];
-      const a0 = awayTeam.toLowerCase().split(' ')[0];
       if(hn.includes(h0) || h0.includes(hn.split(' ')[0])){
         const homeScore = g.scores?.find(s=>s.name===g.home_team)?.score||'?';
         const awayScore = g.scores?.find(s=>s.name===g.away_team)?.score||'?';
-        console.log('Score found:', g.home_team, homeScore, '-', awayScore, g.away_team);
+        console.log('Score:', g.home_team, homeScore, '-', awayScore, g.away_team);
         return { home:g.home_team, away:g.away_team, homeScore, awayScore };
       }
     }
-    console.log('No score found for:', homeTeam, 'vs', awayTeam);
+    console.log('No score for:', homeTeam, 'vs', awayTeam);
     return null;
   } catch(e){ console.error('Odds API error:', e.message); return null; }
 }
@@ -714,7 +622,7 @@ async function getMatchScore(league, homeTeam, awayTeam) {
 async function extractOCR(base64Image) {
   try {
     const imgData = base64Image.includes(',') ? base64Image.split(',')[1] : base64Image;
-    const res = await axios.post('https://vision.googleapis.com/v1/images:annotate?key='+GOOGLE_VISION_KEY2,
+    const res = await axios.post('https://vision.googleapis.com/v1/images:annotate?key='+GOOGLE_VISION_KEY,
       { requests:[{ image:{ content:imgData }, features:[{ type:'TEXT_DETECTION' }] }] }
     );
     return res.data.responses?.[0]?.fullTextAnnotation?.text || '';
@@ -725,15 +633,15 @@ async function analyzeWithClaude(pick, score) {
   try {
     let ticketText = '';
     if(pick.ticketImg) ticketText = await extractOCR(pick.ticketImg);
-    const prompt = 'Partido: '+pick.match+'. Resultado: '+score.home+' '+score.homeScore+' - '+score.awayScore+' '+score.away+'. Texto del ticket: '+ticketText+'. Determina si la apuesta fue GANADA o PERDIDA. Responde SOLO con JSON valido: {"resultado":"GANADO","confianza":90,"detalle":"explicacion"}';
+    const prompt = 'Partido: '+pick.match+'. Resultado: '+score.home+' '+score.homeScore+' - '+score.awayScore+' '+score.away+'. OCR ticket: '+ticketText+'. Responde SOLO JSON: {"resultado":"GANADO","confianza":90,"detalle":"razon"}';
     const res = await axios.post('https://api.anthropic.com/v1/messages',{
-      model:'claude-haiku-4-5-20251001', max_tokens:300,
+      model:'claude-haiku-4-5-20251001',max_tokens:300,
       messages:[{role:'user',content:prompt}]
-    },{headers:{'x-api-key':ANTHROPIC_KEY2,'anthropic-version':'2023-06-01','Content-Type':'application/json'}});
+    },{headers:{'x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01','Content-Type':'application/json'}});
     const text = (res.data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
-    console.log('Claude says:', text.substring(0,200));
-    const match = text.match(/{[sS]*?}/);
-    if(match) return JSON.parse(match[0]);
+    console.log('Claude:', text.substring(0,300));
+    const m = text.match(/\{[\s\S]*?\}/);
+    if(m) return JSON.parse(m[0]);
   } catch(e){ console.error('Claude error:', e.message, e.response?.data?.error?.message); }
   return null;
 }
@@ -746,15 +654,15 @@ async function runPickAnalysis() {
     console.log('Pending picks:', picks.length);
     for(const pick of picks){
       const createdAt = new Date(pick.createdAt);
-      if(now - createdAt < 6*3600*1000){ console.log('Too recent:', pick.match); continue; }
+      if(now - createdAt < 6*3600*1000) continue;
       console.log('Analyzing:', pick.match);
       const parts = pick.match.split(' vs ');
       if(parts.length < 2) continue;
       const score = await getMatchScore(pick.league, parts[0].trim(), parts[1].trim());
-      if(!score){ continue; }
+      if(!score) continue;
       const analysis = await analyzeWithClaude(pick, score);
       if(analysis){
-        console.log('Analysis done:', pick.match, '->', analysis.resultado);
+        console.log('Done:', pick.match, '->', analysis.resultado);
         await Pick.findByIdAndUpdate(pick._id, { aiAnalysis: analysis });
       }
     }
@@ -769,77 +677,4 @@ app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   res.json({ success:true, message:'Analisis iniciado' });
 });
 
-app.listen(PORT, () => {
-  console.log('ThePickZone Backend corriendo en puerto ' + PORT);
-  console.log('API-Sports key: ' + API_SPORTS_KEY.substring(0,8) + '...');
-  console.log('MongoDB: ' + (MONGO_URI ? 'configurado' : 'no configurado'));
-});
-
-// ── STRIPE PAYMENTS ───────────────────────────────────────────────────────────
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-
-// Charge card via Stripe
-app.post('/api/payments/charge', auth, async (req, res) => {
-  try {
-    const { paymentMethodId, amount, description } = req.body;
-    if (!paymentMethodId || !amount)
-      return res.status(400).json({ error: 'paymentMethodId y amount requeridos' });
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(amount * 100), // cents
-      currency: 'usd',
-      payment_method: paymentMethodId,
-      confirm: true,
-      description: description || 'ThePickZone',
-      metadata: { userId: req.user.id, userEmail: req.user.email },
-      automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-    });
-
-    res.json({ success: true, paymentIntentId: paymentIntent.id, status: paymentIntent.status });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// Create subscription (Pro plan $20/month)
-app.post('/api/payments/subscribe', auth, async (req, res) => {
-  try {
-    const { paymentMethodId } = req.body;
-
-    // Create or get customer
-    let customer;
-    const existing = await stripe.customers.list({ email: req.user.email, limit: 1 });
-    if (existing.data.length > 0) {
-      customer = existing.data[0];
-    } else {
-      customer = await stripe.customers.create({
-        email: req.user.email,
-        name: req.user.name,
-        payment_method: paymentMethodId,
-        invoice_settings: { default_payment_method: paymentMethodId },
-      });
-    }
-
-    // Charge $20 one-time for now (in production create recurring subscription)
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: 2000, // $20.00
-      currency: 'usd',
-      customer: customer.id,
-      payment_method: paymentMethodId,
-      confirm: true,
-      description: 'ThePickZone Pro - Suscripcion mensual',
-      automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-    });
-
-    // Upgrade user to Pro
-    await User.findByIdAndUpdate(req.user.id, {
-      role: 'pro',
-      proExpiry: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-    });
-
-    res.json({ success: true, paymentIntentId: paymentIntent.id });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
+app.listen(PORT, () => console.log('ThePickZone Backend corriendo en puerto', PORT));
