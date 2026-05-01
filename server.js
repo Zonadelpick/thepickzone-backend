@@ -665,7 +665,8 @@ async function runPickAnalysis() {
         matchDate = new Date(pick.time);
       } else {
         const tp = pick.time?.match(/(d{1,2})s+(w+)s+-s+(d{2}):(d{2})/);
-        if(!tp) continue;
+        console.log('Time parse:', tp?.[0], '-> day:'+tp?.[1],'month:'+tp?.[2]);
+        if(!tp) { console.log('SKIP no parse:', pick.time); continue; }
         const month = mo[tp[2]];
         if(month===undefined) continue;
         matchDate = new Date(now.getFullYear(), month, parseInt(tp[1]), parseInt(tp[3]), parseInt(tp[4]));
