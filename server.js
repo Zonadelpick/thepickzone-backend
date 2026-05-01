@@ -656,6 +656,7 @@ async function runPickAnalysis() {
     const allPicks = await Pick.find({ result: 'pending' });
     console.log('Pending picks:', allPicks.length);
     for(const pick of allPicks){
+      console.log('Processing pick:', pick.match, '| time:', pick.time);
       const parts = pick.match.split(' vs ');
       if(parts.length < 2) continue;
       const mo = {Ene:0,Feb:1,Mar:2,Abr:3,May:4,Jun:5,Jul:6,Ago:7,Sep:8,Oct:9,Nov:10,Dic:11};
