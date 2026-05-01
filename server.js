@@ -760,6 +760,51 @@ app.get('/api/fixtures/odds', async (req, res) => {
     res.json([]);
   }
 });
+
+// Update pick result and tipster stats
+app.put('/api/picks/:id/result', auth, requireAdmin, async (req, res) => {
+  try {
+    const { result } = req.body;
+    if(!['won','lost','void'].includes(result)) return res.status(400).json({ error: 'Invalid result' });
+    const pick = await Pick.findById(req.params.id);
+    if(!pick) return res.status(404).json({ error: 'Pick not found' });
+    await Pick.findByIdAndUpdate(req.params.id, { result });
+    // Update tipster stats
+    if(result !== 'void'){
+      const tipster = await User.findById(pick.tipsterId);
+      if(tipster){
+        const allPicks = await Pick.find({ tipsterId: pick.tipsterId, result: { $in: ['won','lost'] } });
+        const won = allPicks.filter(p => p.result === 'won').length;
+        const total = allPicks.length;
+        const winRate = total > 0 ? Math.round((won/total)*100) : 0;
+        const avgOdds = allPicks.reduce((s,p) => s + (parseFloat(p.odds)||0), 0) / Math.max(total,1);
+        const roi = result === 'won' ? '+' + ((avgOdds-1)*100).toFixed(0)+'%' : '-100%';
+        await User.findByIdAndUpdate(pick.tipsterId, { roi, winRate, totalPicks: total });
+        console.log('Tipster stats updated:', tipster.name, 'ROI:', roi, 'WinRate:', winRate+'%');
+      }
+    }
+    res.json({ success: true, result });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Re-analyze a pick manually
+app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
+  try {
+    const pick = await Pick.findById(req.params.id);
+    if(!pick) return res.status(404).json({ error: 'Pick not found' });
+    const parts = pick.match.split(' vs ');
+    if(parts.length < 2) return res.status(400).json({ error: 'Invalid match format' });
+    const score = await getMatchScore(pick.league, parts[0].trim(), parts[1].trim());
+    if(!score) return res.status(404).json({ error: 'Score not found' });
+    const analysis = await analyzeWithClaude(pick, score);
+    if(analysis){
+      await Pick.findByIdAndUpdate(pick._id, { aiAnalysis: analysis });
+      res.json({ success: true, analysis });
+    } else {
+      res.status(500).json({ error: 'Analysis failed' });
+    }
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   runPickAnalysis();
   res.json({ success: true, message: 'Analisis iniciado' });
