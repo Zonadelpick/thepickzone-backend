@@ -37,7 +37,7 @@ const PickSchema = new mongoose.Schema({
   tipsterId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   league:    { type: String, required: true },
   sport:     { type: String, required: true },
-  flag:      { type: String, default: '=ƒîì' },
+  flag:      { type: String, default: '=ï¿½ï¿½ï¿½' },
   match:     { type: String, required: true },
   time:      { type: String, required: true },
   odds:      { type: Number, required: true },
@@ -84,7 +84,7 @@ function requireAdmin(req, res, next) {
 }
 
 const SPORT_CONFIG = {
-  'Liga de Espa+¦a':             { api: 'football', id: 140 },
+  'Liga de Espa+ï¿½a':             { api: 'football', id: 140 },
   'Premier League':             { api: 'football', id: 39  },
   'Serie A':                    { api: 'football', id: 135 },
   'Bundesliga':                 { api: 'football', id: 78  },
@@ -620,6 +620,44 @@ setInterval(runPickAnalysis, 60*60*1000);
 setTimeout(runPickAnalysis, 5*60*1000);
 
 // Manual trigger endpoint for admin
+
+// Odds API fixtures endpoint
+app.get('/api/fixtures/odds', async (req, res) => {
+  try {
+    const { league } = req.query;
+    const SPORT_KEYS = {
+      'NBA':'basketball_nba','MLB':'baseball_mlb','NHL':'icehockey_nhl',
+      'NFL':'americanfootball_nfl','MLS':'soccer_usa_mls',
+      'Liga MX':'soccer_mexico_ligamx','Premier League':'soccer_epl',
+      'Champions League':'soccer_uefa_champs_league','Liga de Espana':'soccer_spain_la_liga',
+      'Bundesliga':'soccer_germany_bundesliga','Serie A':'soccer_italy_serie_a',
+      'Ligue 1':'soccer_france_ligue_one','Liga MX':'soccer_mexico_ligamx',
+      'Copa Libertadores':'soccer_conmebol_copa_libertadores',
+      'Liga Colombia':'soccer_colombia_primera_a','Liga Argentina':'soccer_argentina_primera_division',
+      'Liga Brasil':'soccer_brazil_campeonato','Liga Chile':'soccer_chile_campeonato'
+    };
+    const sportKey = SPORT_KEYS[league];
+    if(!sportKey) return res.json([]);
+    const url = 'https://api.the-odds-api.com/v4/sports/'+sportKey+'/events/?apiKey='+process.env.ODDS_API_KEY+'&dateFormat=iso';
+    const r = await axios.get(url);
+    const events = r.data || [];
+    const now = new Date();
+    const in7days = new Date(now.getTime() + 7*24*3600*1000);
+    const fixtures = events
+      .filter(e => new Date(e.commence_time) > now && new Date(e.commence_time) < in7days)
+      .map(e => ({
+        id: e.id,
+        home: e.home_team,
+        away: e.away_team,
+        time: e.commence_time,
+        league: league
+      }));
+    res.json(fixtures);
+  } catch(err) {
+    console.error('Odds fixtures error:', err.message);
+    res.json([]);
+  }
+});
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   runPickAnalysis();
   res.json({ success: true, message: 'Analisis iniciado' });
@@ -678,9 +716,26 @@ async function analyzeWithClaude(pick, score) {
   try {
     let ticketText = '';
     if(pick.ticketImg) ticketText = await extractOCR(pick.ticketImg);
-    const prompt = 'Partido: '+pick.match+'. Resultado: '+score.home+' '+score.homeScore+' - '+score.awayScore+' '+score.away+'. OCR ticket: '+ticketText+'. Responde SOLO JSON: {"resultado":"GANADO","confianza":90,"detalle":"razon"}';
+    const prompt = `Eres un experto en apuestas deportivas. Analiza este ticket y determina si la apuesta fue GANADA o PERDIDA.
+
+PARTIDO: ${pick.match}
+RESULTADO FINAL: ${score.home} ${score.homeScore} - ${score.awayScore} ${score.away}
+TEXTO OCR DEL TICKET: ${ticketText}
+
+INSTRUCCIONES:
+- Lee el ticket OCR cuidadosamente e identifica: tipo de apuesta, seleccion, linea/handicap
+- Tipos de apuesta comunes: Moneyline (ganador directo), Spread/Handicap (diferencia de puntos), Total Over/Under (puntos totales), Props de jugadores (stats individuales), Parlays (multiples apuestas combinadas), Primera mitad/Segundo tiempo
+- Para Spread: si apuesta es -6.5, el equipo debe ganar por mas de 6.5 puntos
+- Para Over/Under: compara total de puntos del partido con la linea
+- Para Props: si no tienes stats del jugador, indica NECESITA_VERIFICACION
+- Para Parlays: todas las apuestas deben ganar para que el parlay gane
+- Si el ticket no corresponde al partido indicado, indica NO_RELACIONADO
+- Si no puedes determinar con certeza, indica NECESITA_VERIFICACION
+
+Responde SOLO con JSON valido sin markdown:
+{"resultado":"GANADO o PERDIDO o NECESITA_VERIFICACION o NO_RELACIONADO","confianza":0-100,"detalle":"explicacion detallada de cada apuesta del ticket","tipo_apuesta":"Moneyline/Spread/Total/Prop/Parlay"}`;
     const res = await axios.post('https://api.anthropic.com/v1/messages',{
-      model:'claude-haiku-4-5-20251001',max_tokens:300,
+      model:'claude-haiku-4-5-20251001',max_tokens:800,
       messages:[{role:'user',content:prompt}]
     },{headers:{'x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01','Content-Type':'application/json'}});
     const text = (res.data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
