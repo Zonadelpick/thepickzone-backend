@@ -723,3 +723,4 @@ app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
 });
 app.listen(PORT, () => {
   console.log('ThePickZone Backend corriendo en puerto ' + PORT);
+});
