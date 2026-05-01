@@ -672,176 +672,101 @@ async function getScoreFromOddsAPI(league, homeTeam, awayTeam) {
   } catch(e) { console.error('Odds API error:', e.message); return null; }
 }
 
-const GOOGLE_VISION_KEY = process.env.GOOGLE_VISION_KEY;
 
-async function extractTicketText(base64Image) {
+const ODDS_API_KEY = process.env.ODDS_API_KEY;
+const ANTHROPIC_KEY2 = process.env.ANTHROPIC_API_KEY;
+const GOOGLE_VISION_KEY2 = process.env.GOOGLE_VISION_KEY;
+
+const ODDS_SPORT_KEYS = {
+  'NBA':'basketball_nba','MLB':'baseball_mlb','NHL':'icehockey_nhl',
+  'NFL':'americanfootball_nfl','MLS':'soccer_usa_mls',
+  'Liga MX':'soccer_mexico_ligamx','Premier League':'soccer_epl',
+  'Champions League':'soccer_uefa_champs_league','Liga de Espana':'soccer_spain_la_liga',
+  'Bundesliga':'soccer_germany_bundesliga','Serie A':'soccer_italy_serie_a','Ligue 1':'soccer_france_ligue_one'
+};
+
+async function getMatchScore(league, homeTeam, awayTeam) {
   try {
-    const imgData = base64Image.includes(',') ? base64Image.split(',')[1] : base64Image;
-    const res = await axios.post(
-      'https://vision.googleapis.com/v1/images:annotate?key=' + GOOGLE_VISION_KEY,
-      { requests: [{ image: { content: imgData }, features: [{ type: 'TEXT_DETECTION' }] }] }
-    );
-    const text = res.data.responses?.[0]?.fullTextAnnotation?.text || '';
-    console.log('OCR text:', text.substring(0, 200));
-    return text;
-  } catch(e) {
-    console.error('Vision OCR error:', e.message);
-    return '';
-  }
+    const sportKey = ODDS_SPORT_KEYS[league];
+    if(!sportKey){ console.log('No sport key for:', league); return null; }
+    const url = 'https://api.the-odds-api.com/v4/sports/'+sportKey+'/scores/?apiKey='+ODDS_API_KEY+'&daysFrom=3';
+    const r = await axios.get(url);
+    const games = r.data || [];
+    console.log('Odds API:', games.length, 'games for', league);
+    for(const g of games){
+      if(!g.completed) continue;
+      const hn = (g.home_team||'').toLowerCase();
+      const an = (g.away_team||'').toLowerCase();
+      const h0 = homeTeam.toLowerCase().split(' ')[0];
+      const a0 = awayTeam.toLowerCase().split(' ')[0];
+      if(hn.includes(h0) || h0.includes(hn.split(' ')[0])){
+        const homeScore = g.scores?.find(s=>s.name===g.home_team)?.score||'?';
+        const awayScore = g.scores?.find(s=>s.name===g.away_team)?.score||'?';
+        console.log('Score found:', g.home_team, homeScore, '-', awayScore, g.away_team);
+        return { home:g.home_team, away:g.away_team, homeScore, awayScore };
+      }
+    }
+    console.log('No score found for:', homeTeam, 'vs', awayTeam);
+    return null;
+  } catch(e){ console.error('Odds API error:', e.message); return null; }
 }
 
-async function analyzePickWithClaude(pick, espnResult) {
+async function extractOCR(base64Image) {
+  try {
+    const imgData = base64Image.includes(',') ? base64Image.split(',')[1] : base64Image;
+    const res = await axios.post('https://vision.googleapis.com/v1/images:annotate?key='+GOOGLE_VISION_KEY2,
+      { requests:[{ image:{ content:imgData }, features:[{ type:'TEXT_DETECTION' }] }] }
+    );
+    return res.data.responses?.[0]?.fullTextAnnotation?.text || '';
+  } catch(e){ console.error('OCR error:', e.message); return ''; }
+}
+
+async function analyzeWithClaude(pick, score) {
   try {
     let ticketText = '';
-    if(pick.ticketImg) {
-      ticketText = await extractTicketText(pick.ticketImg);
-    }
-    const prompt = 'Partido: '+pick.match+'. Resultado final: '+espnResult.home+' '+espnResult.homeScore+' - '+espnResult.awayScore+' '+espnResult.away+'. Texto del ticket de apuesta: '+ticketText+'. Con base en el resultado del partido y el ticket, determina si la apuesta fue GANADA o PERDIDA. Responde SOLO con JSON: {"resultado":"GANADO" o "PERDIDO" o "VOID","confianza":0-100,"detalle":"explicacion breve de por que gano o perdio"}';
-    
-    const res = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 300,
-      messages: [{ role: 'user', content: prompt }]
-    }, { headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' }});
-    
+    if(pick.ticketImg) ticketText = await extractOCR(pick.ticketImg);
+    const prompt = 'Partido: '+pick.match+'. Resultado: '+score.home+' '+score.homeScore+' - '+score.awayScore+' '+score.away+'. Texto del ticket: '+ticketText+'. Determina si la apuesta fue GANADA o PERDIDA. Responde SOLO con JSON valido: {"resultado":"GANADO","confianza":90,"detalle":"explicacion"}';
+    const res = await axios.post('https://api.anthropic.com/v1/messages',{
+      model:'claude-haiku-4-5-20251001', max_tokens:300,
+      messages:[{role:'user',content:prompt}]
+    },{headers:{'x-api-key':ANTHROPIC_KEY2,'anthropic-version':'2023-06-01','Content-Type':'application/json'}});
     const text = (res.data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
-    console.log('Claude response:', text.substring(0, 200));
-    const match = text.match(/{[sS]*}/);
+    console.log('Claude says:', text.substring(0,200));
+    const match = text.match(/{[sS]*?}/);
     if(match) return JSON.parse(match[0]);
-  } catch(e) { 
-    console.error('Claude error:', e.message, e.response?.data?.error?.message);
-  }
+  } catch(e){ console.error('Claude error:', e.message, e.response?.data?.error?.message); }
   return null;
 }
 
 async function runPickAnalysis() {
   try {
     const now = new Date();
-    console.log('runPickAnalysis started, time:', now);
-    const picks = await Pick.find({ result: 'pending', ticketImg: { $exists: true } });
-    console.log('Found picks:', picks.length);
+    console.log('runPickAnalysis:', now.toISOString());
+    const picks = await Pick.find({ result:'pending' });
+    console.log('Pending picks:', picks.length);
     for(const pick of picks){
-      // Parse pick time to check if match has ended (assume 3 hours after start)
-      const timeStr = pick.time;
-      if(!timeStr) continue;
-      const mo = {Ene:0,Feb:1,Mar:2,Abr:3,May:4,Jun:5,Jul:6,Ago:7,Sep:8,Oct:9,Nov:10,Dic:11};
-      const p = timeStr.match(/(\d{1,2})\s+(\w+)\s+-\s+(\d{2}):(\d{2})/);
-      if(!p) continue;
-      const month = mo[p[2]];
-      if(month===undefined) continue;
-      const matchTime = new Date(now.getFullYear(), month, parseInt(p[1]), parseInt(p[3]), parseInt(p[4]));
-      const endTime = new Date(matchTime.getTime() + 3*60*60*1000);
-      console.log('Pick:', pick.match, '| time:', pick.time, '| ended:', now > endTime);
-      if(now > endTime){
-        await analyzePickResult(pick);
+      const createdAt = new Date(pick.createdAt);
+      if(now - createdAt < 6*3600*1000){ console.log('Too recent:', pick.match); continue; }
+      console.log('Analyzing:', pick.match);
+      const parts = pick.match.split(' vs ');
+      if(parts.length < 2) continue;
+      const score = await getMatchScore(pick.league, parts[0].trim(), parts[1].trim());
+      if(!score){ continue; }
+      const analysis = await analyzeWithClaude(pick, score);
+      if(analysis){
+        console.log('Analysis done:', pick.match, '->', analysis.resultado);
+        await Pick.findByIdAndUpdate(pick._id, { aiAnalysis: analysis });
       }
     }
   } catch(e){ console.error('runPickAnalysis error:', e.message); }
 }
 
-// Run every hour
 setInterval(runPickAnalysis, 60*60*1000);
-// Also run on startup after 5 minutes
-setTimeout(runPickAnalysis, 5*60*1000);
-
-// Manual trigger endpoint for admin
-app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
-  runPickAnalysis();
-  res.json({ success: true, message: 'Analisis iniciado' });
-});
-
-
-
-
-async function analyzePickWithClaude(pick, espnResult) {
-  if(!pick.ticketImg || !ANTHROPIC_KEY) return null;
-  try {
-    const imgData = pick.ticketImg.includes(',') ? pick.ticketImg.split(',')[1] : pick.ticketImg;
-    const imgMime = pick.ticketImg.includes('data:image/png') ? 'image/png' : 'image/jpeg';
-    const prompt = 'Partido: '+pick.match+'. Resultado ESPN: '+espnResult.home+' '+espnResult.homeScore+' - '+espnResult.awayScore+' '+espnResult.away+'. Analiza el ticket de apuesta y determina si GANO o PERDIO. Responde SOLO con JSON: {"resultado":"GANADO" o "PERDIDO" o "VOID","confianza":0-100,"detalle":"explicacion breve"}';
-    const res = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 300,
-      messages: [{ role: 'user', content: [
-        { type: 'image', source: { type: 'base64', media_type: imgMime, data: imgData }},
-        { type: 'text', text: prompt }
-      ]}]
-    }, { headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' }});
-    const text = (res.data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
-    const match = text.match(/{[sS]*}/);
-    if(match) return JSON.parse(match[0]);
-  } catch(e) { console.error('Claude error:', e.message, e.response?.data?.error?.message); }
-  return null;
-}
-
-async function runPickAnalysis() {
-  try {
-    const now = new Date();
-    console.log('runPickAnalysis:', now);
-    const allPicks = await Pick.find({ result: 'pending' });
-    console.log('Pending picks:', allPicks.length);
-    for(const pick of allPicks){
-      console.log('Processing pick:', pick.match);
-      const parts = pick.match.split(' vs ');
-      if(parts.length < 2) continue;
-      // Use createdAt + 6h as match end proxy
-      const createdAt = new Date(pick.createdAt);
-      const endTime = new Date(createdAt.getTime() + 6*60*60*1000);
-      if(now < endTime){ console.log('Too recent:', pick.match); continue; }
-      const matchDate = createdAt;
-      console.log('Will analyze:', pick.match);
-      const ESPN_PATHS = { 'NBA':'basketball/nba','MLB':'baseball/mlb','NHL':'hockey/nhl','NFL':'football/nfl','MLS':'soccer/usa.1' };
-      const path = ESPN_PATHS[pick.league];
-      if(!path){ console.log('No ESPN path for:', pick.league); continue; }
-      const dateStr = matchDate.toISOString().split('T')[0].replace(/-/g,'');
-
-
-
-
-
-
-
-
-
-
-
-
-
-      try {
-        const r = await axios.get('https://site.api.espn.com/apis/site/v2/sports/'+path+'/scoreboard?dates='+dateStr);
-        const events = r.data.events||[];
-        let espnResult = null;
-        for(const e of events){
-          const comps = e.competitions?.[0];
-          const home = comps?.competitors?.find(t=>t.homeAway==='home');
-          const away = comps?.competitors?.find(t=>t.homeAway==='away');
-          const hn = home?.team?.displayName||'';
-          const an = away?.team?.displayName||'';
-          const h0 = parts[0].trim().toLowerCase();
-          const a0 = parts[1].trim().toLowerCase();
-          if((hn.toLowerCase().includes(h0.split(' ')[0])||h0.includes(hn.toLowerCase().split(' ')[0])) && e.status?.type?.completed){
-            espnResult = { home:hn, away:an, homeScore:home?.score||'?', awayScore:away?.score||'?' };
-            break;
-          }
-        }
-        if(!espnResult){ console.log('No ESPN result for:', pick.match); continue; }
-        console.log('ESPN result:', JSON.stringify(espnResult));
-        const analysis = await analyzePickWithClaude(pick, espnResult);
-        if(analysis){
-          console.log('Claude analysis:', JSON.stringify(analysis));
-          await Pick.findByIdAndUpdate(pick._id, { aiAnalysis: analysis });
-        }
-      } catch(e){ console.error('ESPN error:', e.message); }
-    }
-  } catch(e){ console.error('runPickAnalysis error:', e.message); }
-}
-
-setInterval(runPickAnalysis, 60*60*1000);
-setTimeout(runPickAnalysis, 10*1000);
+setTimeout(runPickAnalysis, 5000);
 
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   runPickAnalysis();
-  res.json({ success: true, message: 'Analisis iniciado' });
+  res.json({ success:true, message:'Analisis iniciado' });
 });
 
 app.listen(PORT, () => {
