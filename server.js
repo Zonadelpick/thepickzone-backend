@@ -419,7 +419,7 @@ app.get('/api/fixtures/espn', async (req, res) => {
         id: i+1,
         home: home?.team?.displayName || '',
         away: away?.team?.displayName || '',
-        time: days[d.getDay()]+' '+d.getDate()+' '+months[d.getMonth()]+' - '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'),
+        time: e.date,
         venue: comps?.venue?.fullName || ''
       };
     });
