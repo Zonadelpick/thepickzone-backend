@@ -656,28 +656,32 @@ async function runPickAnalysis() {
     const allPicks = await Pick.find({ result: 'pending' });
     console.log('Pending picks:', allPicks.length);
     for(const pick of allPicks){
-      console.log('Processing pick:', pick.match, '| time:', pick.time);
+      console.log('Processing pick:', pick.match);
       const parts = pick.match.split(' vs ');
       if(parts.length < 2) continue;
-      const mo = {Ene:0,Feb:1,Mar:2,Abr:3,May:4,Jun:5,Jul:6,Ago:7,Sep:8,Oct:9,Nov:10,Dic:11};
-      let matchDate;
-      if(pick.time && pick.time.includes('T')){
-        matchDate = new Date(pick.time);
-      } else {
-        const tp = pick.time?.match(/(d{1,2})s+(w+)s+-s+(d{2}):(d{2})/);
-        console.log('Time parse:', tp?.[0], '-> day:'+tp?.[1],'month:'+tp?.[2]);
-        if(!tp) { console.log('SKIP no parse:', pick.time); continue; }
-        const month = mo[tp[2]];
-        if(month===undefined) continue;
-        matchDate = new Date(now.getFullYear(), month, parseInt(tp[1]), parseInt(tp[3]), parseInt(tp[4]));
-      }
-      const endTime = new Date(matchDate.getTime() + 3*60*60*1000);
-      if(now < endTime){ console.log('Not ended yet:', pick.match); continue; }
-      console.log('Analyzing:', pick.match);
+      // Use createdAt + 6h as match end proxy
+      const createdAt = new Date(pick.createdAt);
+      const endTime = new Date(createdAt.getTime() + 6*60*60*1000);
+      if(now < endTime){ console.log('Too recent:', pick.match); continue; }
+      const matchDate = createdAt;
+      console.log('Will analyze:', pick.match);
       const ESPN_PATHS = { 'NBA':'basketball/nba','MLB':'baseball/mlb','NHL':'hockey/nhl','NFL':'football/nfl','MLS':'soccer/usa.1' };
       const path = ESPN_PATHS[pick.league];
       if(!path){ console.log('No ESPN path for:', pick.league); continue; }
       const dateStr = matchDate.toISOString().split('T')[0].replace(/-/g,'');
+
+
+
+
+
+
+
+
+
+
+
+
+
       try {
         const r = await axios.get('https://site.api.espn.com/apis/site/v2/sports/'+path+'/scoreboard?dates='+dateStr);
         const events = r.data.events||[];
