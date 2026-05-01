@@ -309,10 +309,10 @@ app.get('/api/fixtures', async (req, res) => {
     res.status(500).json({ error: 'Error API-Sports', details: err.message });
   }
 });
-
+app.get('/api/picks', async (req, res) => {
+  try {
     const cutoff = new Date(Date.now() - 6*3600000);
     const picks = await Pick.find({ createdAt: { $gte: cutoff }, result: 'pending' })
-    const picks = await Pick.find({ createdAt: { $gte: new Date(Date.now() - 7*86400000) } })
       .sort({ createdAt: -1 }).select('-ticketImg -buyers');
     res.json(picks);
   } catch (err) { res.status(500).json({ error: err.message }); }
