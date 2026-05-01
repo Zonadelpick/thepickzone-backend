@@ -649,7 +649,6 @@ async function extractTicketText(base64Image) {
 
 async function analyzePickWithClaude(pick, espnResult) {
   try {
-    const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
     let ticketText = '';
     if(pick.ticketImg) {
       ticketText = await extractTicketText(pick.ticketImg);
