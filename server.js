@@ -842,6 +842,19 @@ app.post('/api/admin/reset-stats', auth, requireAdmin, async (req, res) => {
     res.json({ success: true });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
+
+// Update user profile
+app.put('/api/auth/profile', auth, async (req, res) => {
+  try {
+    const { name, avatar } = req.body;
+    const updated = await User.findByIdAndUpdate(
+      req.user.id,
+      { name, avatar },
+      { new: true }
+    ).select('-password');
+    res.json(updated);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   runPickAnalysis();
   res.json({ success: true, message: 'Analisis iniciado' });
