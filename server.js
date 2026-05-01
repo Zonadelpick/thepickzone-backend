@@ -805,6 +805,43 @@ app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
     }
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
+
+// Admin picks endpoints
+app.get('/api/admin/picks-pending', auth, requireAdmin, async (req, res) => {
+  try {
+    const picks = await Pick.find({ result: 'pending' }).sort({ createdAt: -1 });
+    res.json(picks);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/picks-all', auth, requireAdmin, async (req, res) => {
+  try {
+    const picks = await Pick.find().sort({ createdAt: -1 }).select('-ticketImg');
+    res.json(picks);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/stats', auth, requireAdmin, async (req, res) => {
+  try {
+    const users = await User.countDocuments();
+    const picks = await Pick.countDocuments();
+    res.json({ users, picks, revenue: 0, commission: 0 });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/users', auth, requireAdmin, async (req, res) => {
+  try {
+    const users = await User.find().select('-password').sort({ createdAt: -1 });
+    res.json(users);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/reset-stats', auth, requireAdmin, async (req, res) => {
+  try {
+    await User.updateMany({ role: 'pro' }, { roi: '+0%', balance: 0 });
+    res.json({ success: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   runPickAnalysis();
   res.json({ success: true, message: 'Analisis iniciado' });
