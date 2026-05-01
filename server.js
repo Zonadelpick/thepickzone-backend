@@ -708,7 +708,7 @@ app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
 });
 
 
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+
 
 async function analyzePickWithClaude(pick, espnResult) {
   if(!pick.ticketImg || !ANTHROPIC_KEY) return null;
