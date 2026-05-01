@@ -628,6 +628,89 @@ app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
+
+const GOOGLE_VISION_KEY = process.env.GOOGLE_VISION_KEY;
+
+async function extractTicketText(base64Image) {
+  try {
+    const imgData = base64Image.includes(',') ? base64Image.split(',')[1] : base64Image;
+    const res = await axios.post(
+      'https://vision.googleapis.com/v1/images:annotate?key=' + GOOGLE_VISION_KEY,
+      { requests: [{ image: { content: imgData }, features: [{ type: 'TEXT_DETECTION' }] }] }
+    );
+    const text = res.data.responses?.[0]?.fullTextAnnotation?.text || '';
+    console.log('OCR text:', text.substring(0, 200));
+    return text;
+  } catch(e) {
+    console.error('Vision OCR error:', e.message);
+    return '';
+  }
+}
+
+async function analyzePickWithClaude(pick, espnResult) {
+  try {
+    const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+    let ticketText = '';
+    if(pick.ticketImg) {
+      ticketText = await extractTicketText(pick.ticketImg);
+    }
+    const prompt = 'Partido: '+pick.match+'. Resultado final: '+espnResult.home+' '+espnResult.homeScore+' - '+espnResult.awayScore+' '+espnResult.away+'. Texto del ticket de apuesta: '+ticketText+'. Con base en el resultado del partido y el ticket, determina si la apuesta fue GANADA o PERDIDA. Responde SOLO con JSON: {"resultado":"GANADO" o "PERDIDO" o "VOID","confianza":0-100,"detalle":"explicacion breve de por que gano o perdio"}';
+    
+    const res = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }]
+    }, { headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' }});
+    
+    const text = (res.data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
+    console.log('Claude response:', text.substring(0, 200));
+    const match = text.match(/{[sS]*}/);
+    if(match) return JSON.parse(match[0]);
+  } catch(e) { 
+    console.error('Claude error:', e.message, e.response?.data?.error?.message);
+  }
+  return null;
+}
+
+async function runPickAnalysis() {
+  try {
+    const now = new Date();
+    console.log('runPickAnalysis started, time:', now);
+    const picks = await Pick.find({ result: 'pending', ticketImg: { $exists: true } });
+    console.log('Found picks:', picks.length);
+    for(const pick of picks){
+      // Parse pick time to check if match has ended (assume 3 hours after start)
+      const timeStr = pick.time;
+      if(!timeStr) continue;
+      const mo = {Ene:0,Feb:1,Mar:2,Abr:3,May:4,Jun:5,Jul:6,Ago:7,Sep:8,Oct:9,Nov:10,Dic:11};
+      const p = timeStr.match(/(\d{1,2})\s+(\w+)\s+-\s+(\d{2}):(\d{2})/);
+      if(!p) continue;
+      const month = mo[p[2]];
+      if(month===undefined) continue;
+      const matchTime = new Date(now.getFullYear(), month, parseInt(p[1]), parseInt(p[3]), parseInt(p[4]));
+      const endTime = new Date(matchTime.getTime() + 3*60*60*1000);
+      console.log('Pick:', pick.match, '| time:', pick.time, '| ended:', now > endTime);
+      if(now > endTime){
+        await analyzePickResult(pick);
+      }
+    }
+  } catch(e){ console.error('runPickAnalysis error:', e.message); }
+}
+
+// Run every hour
+setInterval(runPickAnalysis, 60*60*1000);
+// Also run on startup after 5 minutes
+setTimeout(runPickAnalysis, 5*60*1000);
+
+// Manual trigger endpoint for admin
+app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
+  runPickAnalysis();
+  res.json({ success: true, message: 'Analisis iniciado' });
+});
+
+
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+
 async function analyzePickWithClaude(pick, espnResult) {
   if(!pick.ticketImg || !ANTHROPIC_KEY) return null;
   try {
