@@ -440,6 +440,75 @@ const paypalEnv = new paypal.core.LiveEnvironment(
 );
 const paypalClient = new paypal.core.PayPalHttpClient(paypalEnv);
 
+
+// Purchase model
+const PurchaseSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  pickId: { type: mongoose.Schema.Types.ObjectId, ref: 'Pick', required: true },
+  amount: { type: Number, required: true },
+  paypalOrderId: { type: String },
+  status: { type: String, default: 'pending' },
+  createdAt: { type: Date, default: Date.now }
+});
+const Purchase = mongoose.model('Purchase', PurchaseSchema);
+
+// Create pick purchase order
+app.post('/api/picks/:id/purchase/create', auth, async (req, res) => {
+  try {
+    const pick = await Pick.findById(req.params.id);
+    if(!pick) return res.status(404).json({ error: 'Pick not found' });
+    if(pick.price === 0) {
+      // Free pick - register purchase directly
+      await Purchase.create({ userId: req.user.id, pickId: pick._id, amount: 0, status: 'completed' });
+      await Pick.findByIdAndUpdate(pick._id, { $addToSet: { buyers: req.user.id } });
+      return res.json({ success: true, free: true });
+    }
+    // Create PayPal order
+    const request = new paypal.orders.OrdersCreateRequest();
+    request.prefer('return=representation');
+    request.requestBody({
+      intent: 'CAPTURE',
+      purchase_units: [{ amount: { currency_code: 'USD', value: String(pick.price) }, description: 'Pick: '+pick.match }]
+    });
+    const order = await paypalClient.execute(request);
+    // Save pending purchase
+    await Purchase.create({ userId: req.user.id, pickId: pick._id, amount: pick.price, paypalOrderId: order.result.id, status: 'pending' });
+    res.json({ orderId: order.result.id });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Capture pick purchase
+app.post('/api/picks/:id/purchase/capture', auth, async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    const request = new paypal.orders.OrdersCaptureRequest(orderId);
+    request.requestBody({});
+    const capture = await paypalClient.execute(request);
+    if(capture.result.status === 'COMPLETED'){
+      await Purchase.findOneAndUpdate({ paypalOrderId: orderId }, { status: 'completed' });
+      await Pick.findByIdAndUpdate(req.params.id, { $addToSet: { buyers: req.user.id } });
+      res.json({ success: true });
+    } else {
+      res.status(400).json({ error: 'Pago no completado' });
+    }
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Check if user has access to pick
+app.get('/api/picks/:id/access', auth, async (req, res) => {
+  try {
+    const pick = await Pick.findById(req.params.id);
+    if(!pick) return res.status(404).json({ error: 'Pick not found' });
+    // Owner always has access
+    if(pick.tipsterId?.toString() === req.user.id) return res.json({ access: true, reason: 'owner' });
+    // Check purchase
+    const purchase = await Purchase.findOne({ userId: req.user.id, pickId: pick._id, status: 'completed' });
+    if(purchase) return res.json({ access: true, reason: 'purchased' });
+    // Free pick
+    if(pick.price === 0) return res.json({ access: true, reason: 'free' });
+    res.json({ access: false });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
 app.post('/api/paypal/create-order', auth, async (req, res) => {
   try {
     const { amount, description } = req.body;
