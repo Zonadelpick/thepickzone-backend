@@ -924,6 +924,22 @@ app.put('/api/auth/profile', auth, async (req, res) => {
     res.json(updated);
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
+
+// Clean database - remove all fake data
+app.post('/api/admin/clean-db', async (req, res) => {
+  const { secret } = req.body;
+  if(secret !== 'tpz-clean-2026') return res.status(403).json({ error: 'Forbidden' });
+  try {
+    // Keep only real users
+    const keepEmails = ['admin@thepickzone.com','75_solos_cierne@icloud.com','fernando.martinez10@hotmail.com'];
+    const deleted = await User.deleteMany({ email: { $nin: keepEmails } });
+    // Delete all picks
+    const picksDeleted = await Pick.deleteMany({});
+    // Reset real users stats
+    await User.updateMany({}, { roi: '+0%', balance: 0, winRate: 0, totalPicks: 0, avgOdds: 0 });
+    res.json({ success: true, usersDeleted: deleted.deletedCount, picksDeleted: picksDeleted.deletedCount });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   runPickAnalysis();
   res.json({ success: true, message: 'Analisis iniciado' });
