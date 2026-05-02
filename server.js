@@ -442,15 +442,15 @@ const paypalClient = new paypal.core.PayPalHttpClient(paypalEnv);
 
 
 // Purchase model
-const PurchaseSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  pickId: { type: mongoose.Schema.Types.ObjectId, ref: 'Pick', required: true },
-  amount: { type: Number, required: true },
-  paypalOrderId: { type: String },
-  status: { type: String, default: 'pending' },
-  createdAt: { type: Date, default: Date.now }
-});
-const Purchase = mongoose.model('Purchase', PurchaseSchema);
+
+
+
+
+
+
+
+
+
 
 // Create pick purchase order
 app.post('/api/picks/:id/purchase/create', auth, async (req, res) => {
