@@ -940,6 +940,16 @@ app.post('/api/admin/clean-db', async (req, res) => {
     res.json({ success: true, usersDeleted: deleted.deletedCount, picksDeleted: picksDeleted.deletedCount });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
+
+// Public tipsters ranking endpoint - reads from MongoDB stats
+app.get('/api/tipsters', async (req, res) => {
+  try {
+    const tipsters = await User.find({ role: { $in: ['pro','admin'] } })
+      .select('-password -proExpiry')
+      .sort({ roi: -1 });
+    res.json(tipsters);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   runPickAnalysis();
   res.json({ success: true, message: 'Analisis iniciado' });
