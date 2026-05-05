@@ -148,6 +148,19 @@ app.post('/api/picks', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+app.get('/api/picks/:id/full', auth, async (req, res) => {
+  try {
+    const pick = await Pick.findById(req.params.id);
+    if(!pick) return res.status(404).json({ error: 'Pick not found' });
+    const isOwner = String(pick.tipsterId) === String(req.user.id);
+    const isPurchased = pick.buyers?.some(b=>String(b)===String(req.user.id));
+    const isFree = pick.price === 0;
+    const isAdmin = req.user.role === 'admin';
+    if(!isOwner && !isPurchased && !isFree && !isAdmin) return res.status(403).json({ error: 'No tienes acceso' });
+    res.json(pick);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 app.put('/api/picks/:id/result', auth, requireAdmin, async (req, res) => {
   try {
     const { result } = req.body;
