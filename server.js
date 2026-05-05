@@ -135,7 +135,7 @@ app.put('/api/auth/profile', auth, async (req, res) => {
 app.get('/api/picks', async (req, res) => {
   try {
     const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
-    const picks = await Pick.find({ result: 'pending', createdAt: { $gte: sixHoursAgo } }).sort({ createdAt: -1 }).select('-ticketImg');
+    const picks = await Pick.find({ result: 'pending', createdAt: { $gte: sixHoursAgo } }).sort({ createdAt: -1 });
     res.json(picks);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
