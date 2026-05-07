@@ -390,5 +390,44 @@ app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
 });
 
 // ── SERVER ────────────────────────────────────────────────────────────────────
+
+// ── PICKS FULL (with image) ───────────────────────────────────────────────────
+app.get('/api/picks/:id/full', auth, async (req, res) => {
+  try {
+    const pick = await Pick.findById(req.params.id);
+    if (!pick) return res.status(404).json({ error: 'Pick not found' });
+    const isOwner = String(pick.tipsterId) === String(req.user.id);
+    const isPurchased = pick.buyers?.some(b => String(b) === String(req.user.id));
+    const isFree = pick.price === 0;
+    const isAdmin = req.user.role === 'admin';
+    if (!isOwner && !isPurchased && !isFree && !isAdmin) return res.status(403).json({ error: 'No tienes acceso' });
+    res.json(pick);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── ADMIN SET ROLE ────────────────────────────────────────────────────────────
+app.post('/api/admin/set-role', async (req, res) => {
+  try {
+    const { secret, email, role } = req.body;
+    if (secret !== 'tpz-setup-2026') return res.status(403).json({ error: 'Forbidden' });
+    const update = { role };
+    if (role === 'pro') update.proExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const user = await User.findOneAndUpdate({ email }, update, { new: true }).select('-password');
+    res.json({ success: true, email, role, user });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── CLEAN DB ──────────────────────────────────────────────────────────────────
+app.post('/api/admin/clean-db', async (req, res) => {
+  try {
+    const { secret } = req.body;
+    if (secret !== 'tpz-clean-2026') return res.status(403).json({ error: 'Forbidden' });
+    const keepEmails = ['admin@thepickzone.com','75_solos_cierne@icloud.com','fernando.martinez10@hotmail.com'];
+    const deleted = await User.deleteMany({ email: { $nin: keepEmails } });
+    const picksDeleted = await Pick.deleteMany({});
+    await User.updateMany({}, { roi: '+0%', winRate: 0, totalPicks: 0, balance: 0 });
+    res.json({ success: true, usersDeleted: deleted.deletedCount, picksDeleted: picksDeleted.deletedCount });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
