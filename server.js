@@ -23,9 +23,6 @@ const UserSchema = new mongoose.Schema({
   bio:        { type: String },
   username:   { type: String },
   paypal:     { type: String },
-  bio:        { type: String },
-  username:   { type: String },
-  paypal:     { type: String },
   roi:        { type: String, default: '+0%' },
   winRate:    { type: Number, default: 0 },
   totalPicks: { type: Number, default: 0 },
@@ -39,10 +36,9 @@ const PickSchema = new mongoose.Schema({
   tipster:    { type: String, required: true },
   tipsterId:  { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   league:     { type: String },
-  sport:      { type: String, default: '' },
+  sport:      { type: String },
   flag:       { type: String },
   match:      { type: String, required: true },
-  sport:      { type: String, default: '' },
   time:       { type: String },
   odds:       { type: Number },
   bank:       { type: Number, default: 10 },
@@ -139,7 +135,7 @@ app.put('/api/auth/profile', auth, async (req, res) => {
 app.get('/api/picks', async (req, res) => {
   try {
     const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
-    const picks = await Pick.find({ result: 'pending', createdAt: { $gte: sixHoursAgo } }).sort({ createdAt: -1 });
+    const picks = await Pick.find({ result: 'pending', createdAt: { $gte: sixHoursAgo } }).sort({ createdAt: -1 }).select('-ticketImg');
     res.json(picks);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -152,19 +148,6 @@ app.post('/api/picks', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-
-app.get('/api/picks/:id/full', auth, async (req, res) => {
-  try {
-    const pick = await Pick.findById(req.params.id);
-    if(!pick) return res.status(404).json({ error: 'Pick not found' });
-    const isOwner = String(pick.tipsterId) === String(req.user.id);
-    const isPurchased = pick.buyers?.some(b=>String(b)===String(req.user.id));
-    const isFree = pick.price === 0;
-    const isAdmin = req.user.role === 'admin';
-    if(!isOwner && !isPurchased && !isFree && !isAdmin) return res.status(403).json({ error: 'No tienes acceso' });
-    res.json(pick);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
 app.put('/api/picks/:id/result', auth, requireAdmin, async (req, res) => {
   try {
     const { result } = req.body;
