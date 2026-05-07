@@ -391,6 +391,43 @@ app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
 
 // ── SERVER ────────────────────────────────────────────────────────────────────
 
+
+// ── STRIPE ────────────────────────────────────────────────────────────────────
+const Stripe = require('stripe');
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+app.post('/api/stripe/create-payment-intent', auth, async (req, res) => {
+  try {
+    const { pickId } = req.body;
+    const pick = await Pick.findById(pickId);
+    if (!pick) return res.status(404).json({ error: 'Pick not found' });
+    if (pick.price === 0) {
+      await Pick.findByIdAndUpdate(pickId, { $addToSet: { buyers: req.user.id } });
+      return res.json({ free: true });
+    }
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(pick.price * 100),
+      currency: 'usd',
+      metadata: { pickId: String(pick._id), userId: String(req.user.id) }
+    });
+    res.json({ clientSecret: paymentIntent.client_secret, pickId: String(pick._id) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/stripe/confirm-payment', auth, async (req, res) => {
+  try {
+    const { paymentIntentId, pickId } = req.body;
+    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+    if (pi.status === 'succeeded') {
+      await Pick.findByIdAndUpdate(pickId, { $addToSet: { buyers: req.user.id } });
+      const pick = await Pick.findById(pickId);
+      res.json({ success: true, pick });
+    } else {
+      res.status(400).json({ error: 'Pago no completado', status: pi.status });
+    }
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── PICKS FULL (with image) ───────────────────────────────────────────────────
 app.get('/api/picks/:id/full', auth, async (req, res) => {
   try {
