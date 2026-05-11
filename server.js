@@ -409,6 +409,25 @@ const resolveCheckoutPaymentState = async (session) => {
   };
 };
 
+const STRIPE_CHECKOUT_SESSION_TOKEN = '{CHECKOUT_SESSION_ID}';
+
+const injectCheckoutSessionToken = (url) => {
+  if (!url || typeof url !== 'string') return url;
+  return url.replace(/%7BCHECKOUT_SESSION_ID%7D/gi, STRIPE_CHECKOUT_SESSION_TOKEN);
+};
+
+const normalizeCheckoutSessionId = (value) => {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  try {
+    return decodeURIComponent(trimmed);
+  } catch {
+    return trimmed;
+  }
+};
+
+const isValidCheckoutSessionId = (value) => /^cs_(test|live)_[^\s]+$/.test(value);
+
 app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => {
   try {
     const { pickId } = req.body || {};
@@ -430,12 +449,12 @@ app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => 
     if (!urls) return res.status(400).json({ error: 'URLs de retorno inválidas' });
 
     const user = await User.findById(req.user.id).select('email');
-    const successUrl = appendQueryParams(urls.successUrl, {
+    const successUrl = injectCheckoutSessionToken(appendQueryParams(urls.successUrl, {
       checkout: 'success',
       flow: 'pick',
       pickId: String(pick._id),
-      session_id: '{CHECKOUT_SESSION_ID}'
-    });
+      session_id: STRIPE_CHECKOUT_SESSION_TOKEN
+    }));
     const cancelUrl = appendQueryParams(urls.cancelUrl, {
       checkout: 'cancel',
       flow: 'pick',
@@ -472,8 +491,12 @@ app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => 
 app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) => {
   try {
     const { sessionId, pickId } = req.body || {};
-    if (!sessionId) return res.status(400).json({ error: 'sessionId requerido' });
-    const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['payment_intent'] });
+    const normalizedSessionId = normalizeCheckoutSessionId(sessionId);
+    if (!normalizedSessionId) return res.status(400).json({ error: 'sessionId requerido' });
+    if (normalizedSessionId === STRIPE_CHECKOUT_SESSION_TOKEN || !isValidCheckoutSessionId(normalizedSessionId)) {
+      return res.status(400).json({ error: 'sessionId inválido o incompleto' });
+    }
+    const session = await stripe.checkout.sessions.retrieve(normalizedSessionId, { expand: ['payment_intent'] });
     if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
     const paymentState = await resolveCheckoutPaymentState(session);
     if (!paymentState.isPaid) {
@@ -512,11 +535,11 @@ app.post('/api/stripe/pro/create-checkout-session', auth, async (req, res) => {
     if (!urls) return res.status(400).json({ error: 'URLs de retorno inválidas' });
 
     const user = await User.findById(req.user.id).select('email');
-    const successUrl = appendQueryParams(urls.successUrl, {
+    const successUrl = injectCheckoutSessionToken(appendQueryParams(urls.successUrl, {
       checkout: 'success',
       flow: 'pro',
-      session_id: '{CHECKOUT_SESSION_ID}'
-    });
+      session_id: STRIPE_CHECKOUT_SESSION_TOKEN
+    }));
     const cancelUrl = appendQueryParams(urls.cancelUrl, {
       checkout: 'cancel',
       flow: 'pro'
@@ -551,8 +574,12 @@ app.post('/api/stripe/pro/create-checkout-session', auth, async (req, res) => {
 app.post('/api/stripe/pro/confirm-checkout-session', auth, async (req, res) => {
   try {
     const { sessionId } = req.body || {};
-    if (!sessionId) return res.status(400).json({ error: 'sessionId requerido' });
-    const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['payment_intent'] });
+    const normalizedSessionId = normalizeCheckoutSessionId(sessionId);
+    if (!normalizedSessionId) return res.status(400).json({ error: 'sessionId requerido' });
+    if (normalizedSessionId === STRIPE_CHECKOUT_SESSION_TOKEN || !isValidCheckoutSessionId(normalizedSessionId)) {
+      return res.status(400).json({ error: 'sessionId inválido o incompleto' });
+    }
+    const session = await stripe.checkout.sessions.retrieve(normalizedSessionId, { expand: ['payment_intent'] });
     if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
     const paymentState = await resolveCheckoutPaymentState(session);
     if (!paymentState.isPaid) {
