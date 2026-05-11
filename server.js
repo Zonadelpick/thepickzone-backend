@@ -56,6 +56,17 @@ const PickSchema = new mongoose.Schema({
 });
 const Pick = mongoose.model('Pick', PickSchema);
 
+const PurchaseSchema = new mongoose.Schema({
+  pickId:          { type: mongoose.Schema.Types.ObjectId, ref: 'Pick', required: true },
+  buyerId:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  stripeSessionId: { type: String },
+  amountCents:     { type: Number, default: 0 },
+  currency:        { type: String, default: 'usd' },
+  createdAt:       { type: Date, default: Date.now }
+});
+PurchaseSchema.index({ pickId: 1, buyerId: 1 }, { unique: true });
+const Purchase = mongoose.model('Purchase', PurchaseSchema);
+
 // ── MIDDLEWARE ────────────────────────────────────────────────────────────────
 const auth = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
@@ -429,7 +440,7 @@ const normalizeCheckoutSessionId = (value) => {
 const isValidCheckoutSessionId = (value) => /^cs_(test|live)_[^\s]+$/.test(value);
 const hasPickBuyerAccess = async (pickId, userId) => {
   if (!pickId || !userId) return false;
-  const existingPurchase = await Pick.exists({ _id: pickId, buyers: userId });
+  const existingPurchase = await Purchase.exists({ pickId, buyerId: userId });
   return Boolean(existingPurchase);
 };
 
@@ -445,11 +456,11 @@ app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => 
     const cents = normalizeUsdCents(pick.price);
 
     if (isOwner || isPurchased || cents === 0) {
-      if (!isOwner && !isPurchased) {
+      if (!isOwner && !isPurchased && cents === 0) {
         await Pick.findByIdAndUpdate(pickId, { $addToSet: { buyers: req.user.id } });
       }
       const unlocked = await Pick.findById(pickId);
-      return res.json({ success: true, free: true, alreadyUnlocked: true, pick: unlocked });
+      return res.json({ success: true, free: cents === 0, alreadyUnlocked: true, pick: unlocked });
     }
 
     const urls = getUserBaseUrlFromRequest(req);
@@ -527,6 +538,19 @@ app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) =>
     if (pickId && String(pickId) !== String(targetPickId)) {
       return res.status(400).json({ error: 'pickId no coincide con la sesión de checkout' });
     }
+
+    await Purchase.findOneAndUpdate(
+      { pickId: targetPickId, buyerId: req.user.id },
+      {
+        $set: {
+          stripeSessionId: normalizedSessionId,
+          amountCents: typeof session.amount_total === 'number' ? session.amount_total : 0,
+          currency: session.currency || 'usd'
+        },
+        $setOnInsert: { createdAt: new Date() }
+      },
+      { upsert: true }
+    );
 
     const updated = await Pick.findByIdAndUpdate(
       targetPickId,
