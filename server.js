@@ -4,11 +4,17 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const axios = require('axios');
+const Stripe = require('stripe');
 require('dotenv').config();
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const PRO_PLAN_AMOUNT_USD = 29.99;
+const PRO_PLAN_AMOUNT_CENTS = Math.round(PRO_PLAN_AMOUNT_USD * 100);
+const PRO_PLAN_DURATION_DAYS = 30;
 
 // ── MONGODB ──────────────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGO_URI).then(()=>console.log('MongoDB connected')).catch(e=>console.error(e));
@@ -22,7 +28,6 @@ const UserSchema = new mongoose.Schema({
   avatar:     { type: String },
   bio:        { type: String },
   username:   { type: String },
-  paypal:     { type: String },
   roi:        { type: String, default: '+0%' },
   winRate:    { type: Number, default: 0 },
   totalPicks: { type: Number, default: 0 },
@@ -51,16 +56,6 @@ const PickSchema = new mongoose.Schema({
 });
 const Pick = mongoose.model('Pick', PickSchema);
 
-const PurchaseSchema = new mongoose.Schema({
-  userId:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  pickId:       { type: mongoose.Schema.Types.ObjectId, ref: 'Pick', required: true },
-  amount:       { type: Number, required: true },
-  paypalOrderId:{ type: String },
-  status:       { type: String, default: 'pending' },
-  createdAt:    { type: Date, default: Date.now }
-});
-const Purchase = mongoose.model('Purchase', PurchaseSchema);
-
 // ── MIDDLEWARE ────────────────────────────────────────────────────────────────
 const auth = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
@@ -83,6 +78,23 @@ const auth = async (req, res, next) => {
 const requireAdmin = (req, res, next) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   next();
+};
+
+const isValidHttpUrl = (value) => {
+  try {
+    const u = new URL(value);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+const appendQueryParams = (baseUrl, params) => {
+  const url = new URL(baseUrl);
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  });
+  return url.toString();
 };
 
 // ── AUTH ─────────────────────────────────────────────────────────────────────
@@ -111,7 +123,7 @@ app.post('/api/auth/login', async (req, res) => {
       user.role = 'basic';
     }
     const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET || 'thepickzone_secret_2026', { expiresIn: '7d' });
-    res.json({ token, user: { _id: user._id, name: user.name, email: user.email, role: user.role, avatar: user.avatar, bio: user.bio, paypal: user.paypal, roi: user.roi, winRate: user.winRate, totalPicks: user.totalPicks, proExpiry: user.proExpiry } });
+    res.json({ token, user: { _id: user._id, name: user.name, email: user.email, role: user.role, avatar: user.avatar, bio: user.bio, roi: user.roi, winRate: user.winRate, totalPicks: user.totalPicks, proExpiry: user.proExpiry } });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -125,8 +137,8 @@ app.get('/api/auth/me', auth, async (req, res) => {
 
 app.put('/api/auth/profile', auth, async (req, res) => {
   try {
-    const { name, avatar, bio, username, paypal } = req.body;
-    const updated = await User.findByIdAndUpdate(req.user.id, { name, avatar, bio, username, paypal }, { new: true }).select('-password');
+    const { name, avatar, bio, username } = req.body;
+    const updated = await User.findByIdAndUpdate(req.user.id, { name, avatar, bio, username }, { new: true }).select('-password');
     res.json(updated);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -284,36 +296,6 @@ app.post('/api/admin/clean-db', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── PAYPAL ───────────────────────────────────────────────────────────────────
-const paypal = require('@paypal/checkout-server-sdk');
-const paypalEnv = new paypal.core.LiveEnvironment(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_SECRET || '');
-const paypalClient = new paypal.core.PayPalHttpClient(paypalEnv);
-
-app.post('/api/paypal/create-order', auth, async (req, res) => {
-  try {
-    const { amount, description } = req.body;
-    const request = new paypal.orders.OrdersCreateRequest();
-    request.prefer('return=representation');
-    request.requestBody({ intent: 'CAPTURE', purchase_units: [{ amount: { currency_code: 'USD', value: String(amount) }, description: description || 'ThePickZone Pro' }] });
-    const order = await paypalClient.execute(request);
-    res.json({ orderId: order.result.id });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/paypal/capture-order', auth, async (req, res) => {
-  try {
-    const { orderId } = req.body;
-    const request = new paypal.orders.OrdersCaptureRequest(orderId);
-    request.requestBody({});
-    const capture = await paypalClient.execute(request);
-    if (capture.result.status === 'COMPLETED') {
-      await User.findByIdAndUpdate(req.user.id, { role: 'pro', proExpiry: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) });
-      res.json({ success: true });
-    } else {
-      res.status(400).json({ error: 'Pago no completado' });
-    }
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
 
 // ── AI ANALYSIS ───────────────────────────────────────────────────────────────
 const Anthropic = require('@anthropic-ai/sdk');
@@ -390,41 +372,211 @@ app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
 });
 
 // ── SERVER ────────────────────────────────────────────────────────────────────
+const normalizeUsdCents = (amount) => {
+  const parsed = Number(amount);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.round(parsed * 100);
+};
 
+const getUserBaseUrlFromRequest = (req) => {
+  const { successUrl, cancelUrl, baseUrl } = req.body || {};
+  if (isValidHttpUrl(successUrl) && isValidHttpUrl(cancelUrl)) {
+    return { successUrl, cancelUrl };
+  }
+  if (!isValidHttpUrl(baseUrl)) return null;
+  return {
+    successUrl: `${baseUrl.replace(/\/+$/, '')}/`,
+    cancelUrl: `${baseUrl.replace(/\/+$/, '')}/`
+  };
+};
 
-// ── STRIPE ────────────────────────────────────────────────────────────────────
-const Stripe = require('stripe');
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const resolveCheckoutPaymentState = async (session) => {
+  let paymentIntentStatus = null;
+  if (session?.payment_intent) {
+    if (typeof session.payment_intent === 'string') {
+      const paymentIntent = await stripe.paymentIntents.retrieve(session.payment_intent);
+      paymentIntentStatus = paymentIntent?.status || null;
+    } else {
+      paymentIntentStatus = session.payment_intent?.status || null;
+    }
+  }
+  const isPaid = session?.payment_status === 'paid' || paymentIntentStatus === 'succeeded';
+  return {
+    isPaid,
+    paymentStatus: session?.payment_status || null,
+    checkoutStatus: session?.status || null,
+    paymentIntentStatus
+  };
+};
 
-app.post('/api/stripe/create-payment-intent', auth, async (req, res) => {
+app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => {
   try {
-    const { pickId } = req.body;
+    const { pickId } = req.body || {};
+    if (!pickId) return res.status(400).json({ error: 'pickId requerido' });
     const pick = await Pick.findById(pickId);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
-    if (pick.price === 0) {
+
+    const isOwner = String(pick.tipsterId) === String(req.user.id);
+    const isPurchased = pick.buyers?.some((b) => String(b) === String(req.user.id));
+    const cents = normalizeUsdCents(pick.price);
+
+    if (isOwner || isPurchased || cents === 0) {
       await Pick.findByIdAndUpdate(pickId, { $addToSet: { buyers: req.user.id } });
-      return res.json({ free: true });
+      const unlocked = await Pick.findById(pickId);
+      return res.json({ success: true, free: true, alreadyUnlocked: true, pick: unlocked });
     }
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(pick.price * 100),
-      currency: 'usd',
-      metadata: { pickId: String(pick._id), userId: String(req.user.id) }
+
+    const urls = getUserBaseUrlFromRequest(req);
+    if (!urls) return res.status(400).json({ error: 'URLs de retorno inválidas' });
+
+    const user = await User.findById(req.user.id).select('email');
+    const successUrl = appendQueryParams(urls.successUrl, {
+      checkout: 'success',
+      flow: 'pick',
+      pickId: String(pick._id),
+      session_id: '{CHECKOUT_SESSION_ID}'
     });
-    res.json({ clientSecret: paymentIntent.client_secret, pickId: String(pick._id) });
+    const cancelUrl = appendQueryParams(urls.cancelUrl, {
+      checkout: 'cancel',
+      flow: 'pick',
+      pickId: String(pick._id)
+    });
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      customer_email: user?.email || undefined,
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: cents,
+          product_data: {
+            name: `Pick: ${pick.match}`,
+            description: `${pick.league || 'Sports'} | Tipster: ${pick.tipster || 'ThePickZone'}`
+          }
+        }
+      }],
+      metadata: {
+        flow: 'pick',
+        pickId: String(pick._id),
+        userId: String(req.user.id)
+      }
+    });
+
+    res.json({ success: true, sessionId: session.id, checkoutUrl: session.url });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/stripe/confirm-payment', auth, async (req, res) => {
+app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) => {
   try {
-    const { paymentIntentId, pickId } = req.body;
-    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
-    if (pi.status === 'succeeded') {
-      await Pick.findByIdAndUpdate(pickId, { $addToSet: { buyers: req.user.id } });
-      const pick = await Pick.findById(pickId);
-      res.json({ success: true, pick });
-    } else {
-      res.status(400).json({ error: 'Pago no completado', status: pi.status });
+    const { sessionId, pickId } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: 'sessionId requerido' });
+    const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['payment_intent'] });
+    if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
+    const paymentState = await resolveCheckoutPaymentState(session);
+    if (!paymentState.isPaid) {
+      return res.status(400).json({
+        error: 'Pago no completado',
+        status: paymentState.paymentStatus,
+        checkoutStatus: paymentState.checkoutStatus,
+        paymentIntentStatus: paymentState.paymentIntentStatus
+      });
     }
+    if (session.metadata?.flow !== 'pick') return res.status(400).json({ error: 'La sesión no corresponde a compra de pick' });
+
+    if (session.metadata?.userId && String(session.metadata.userId) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'La sesión no pertenece al usuario autenticado' });
+    }
+    const targetPickId = session.metadata?.pickId;
+    if (!targetPickId) return res.status(400).json({ error: 'No se encontró pickId en la sesión' });
+    if (pickId && String(pickId) !== String(targetPickId)) {
+      return res.status(400).json({ error: 'pickId no coincide con la sesión de checkout' });
+    }
+
+    const updated = await Pick.findByIdAndUpdate(
+      targetPickId,
+      { $addToSet: { buyers: req.user.id } },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ error: 'Pick not found' });
+
+    res.json({ success: true, pick: updated });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/stripe/pro/create-checkout-session', auth, async (req, res) => {
+  try {
+    const urls = getUserBaseUrlFromRequest(req);
+    if (!urls) return res.status(400).json({ error: 'URLs de retorno inválidas' });
+
+    const user = await User.findById(req.user.id).select('email');
+    const successUrl = appendQueryParams(urls.successUrl, {
+      checkout: 'success',
+      flow: 'pro',
+      session_id: '{CHECKOUT_SESSION_ID}'
+    });
+    const cancelUrl = appendQueryParams(urls.cancelUrl, {
+      checkout: 'cancel',
+      flow: 'pro'
+    });
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      customer_email: user?.email || undefined,
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: PRO_PLAN_AMOUNT_CENTS,
+          product_data: {
+            name: 'ThePickZone Pro (30 días)',
+            description: 'Membresía Pro mensual'
+          }
+        }
+      }],
+      metadata: {
+        flow: 'pro',
+        userId: String(req.user.id)
+      }
+    });
+
+    res.json({ success: true, sessionId: session.id, checkoutUrl: session.url });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/stripe/pro/confirm-checkout-session', auth, async (req, res) => {
+  try {
+    const { sessionId } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: 'sessionId requerido' });
+    const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['payment_intent'] });
+    if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
+    const paymentState = await resolveCheckoutPaymentState(session);
+    if (!paymentState.isPaid) {
+      return res.status(400).json({
+        error: 'Pago no completado',
+        status: paymentState.paymentStatus,
+        checkoutStatus: paymentState.checkoutStatus,
+        paymentIntentStatus: paymentState.paymentIntentStatus
+      });
+    }
+    if (session.metadata?.flow !== 'pro') return res.status(400).json({ error: 'La sesión no corresponde a membresía Pro' });
+
+    if (session.metadata?.userId && String(session.metadata.userId) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'La sesión no pertenece al usuario autenticado' });
+    }
+
+    const proExpiry = new Date(Date.now() + PRO_PLAN_DURATION_DAYS * 24 * 60 * 60 * 1000);
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { role: 'pro', proExpiry },
+      { new: true }
+    ).select('-password');
+
+    res.json({ success: true, user, proExpiry });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -434,36 +586,11 @@ app.get('/api/picks/:id/full', auth, async (req, res) => {
     const pick = await Pick.findById(req.params.id);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
     const isOwner = String(pick.tipsterId) === String(req.user.id);
-    const isPurchased = pick.buyers?.some(b => String(b) === String(req.user.id));
-    const isFree = pick.price === 0;
+    const isPurchased = pick.buyers?.some((b) => String(b) === String(req.user.id));
+    const isFree = normalizeUsdCents(pick.price) === 0;
     const isAdmin = req.user.role === 'admin';
     if (!isOwner && !isPurchased && !isFree && !isAdmin) return res.status(403).json({ error: 'No tienes acceso' });
     res.json(pick);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── ADMIN SET ROLE ────────────────────────────────────────────────────────────
-app.post('/api/admin/set-role', async (req, res) => {
-  try {
-    const { secret, email, role } = req.body;
-    if (secret !== 'tpz-setup-2026') return res.status(403).json({ error: 'Forbidden' });
-    const update = { role };
-    if (role === 'pro') update.proExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-    const user = await User.findOneAndUpdate({ email }, update, { new: true }).select('-password');
-    res.json({ success: true, email, role, user });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── CLEAN DB ──────────────────────────────────────────────────────────────────
-app.post('/api/admin/clean-db', async (req, res) => {
-  try {
-    const { secret } = req.body;
-    if (secret !== 'tpz-clean-2026') return res.status(403).json({ error: 'Forbidden' });
-    const keepEmails = ['admin@thepickzone.com','75_solos_cierne@icloud.com','fernando.martinez10@hotmail.com'];
-    const deleted = await User.deleteMany({ email: { $nin: keepEmails } });
-    const picksDeleted = await Pick.deleteMany({});
-    await User.updateMany({}, { roi: '+0%', winRate: 0, totalPicks: 0, balance: 0 });
-    res.json({ success: true, usersDeleted: deleted.deletedCount, picksDeleted: picksDeleted.deletedCount });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 const PORT = process.env.PORT || 3001;
