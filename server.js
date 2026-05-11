@@ -41,6 +41,7 @@ const PickSchema = new mongoose.Schema({
   tipster:    { type: String, required: true },
   tipsterId:  { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   league:     { type: String },
+  sportKey:   { type: String },
   sport:      { type: String },
   flag:       { type: String },
   match:      { type: String, required: true },
@@ -222,19 +223,42 @@ const SPORT_KEYS = {
   'FA Cup': 'soccer_fa_cup', 'DFB Pokal': 'soccer_germany_dfb_pokal',
   'Coppa Italia': 'soccer_italy_coppa_italia', 'Coupe de France': 'soccer_france_coupe_de_france',
 };
+app.get('/api/fixtures/sports', async (req, res) => {
+  try {
+    const all = req.query.all === 'false' ? 'false' : 'true';
+    const url = `https://api.the-odds-api.com/v4/sports?apiKey=${process.env.ODDS_API_KEY}&all=${all}`;
+    const resp = await axios.get(url);
+    const sports = Array.isArray(resp.data) ? resp.data.map((s) => ({
+      key: s.key,
+      title: s.title,
+      group: s.group,
+      description: s.description,
+      active: Boolean(s.active),
+      hasOutrights: Boolean(s.has_outrights)
+    })) : [];
+    res.json(sports);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/api/fixtures/odds', async (req, res) => {
   try {
-    const { league } = req.query;
-    if (!league) return res.status(400).json({ error: 'League required' });
-    const sportKey = SPORT_KEYS[league];
-    if (!sportKey) return res.json([]);
-    const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/events?apiKey=${process.env.ODDS_API_KEY}&dateFormat=iso`;
+    const { league, sportKey } = req.query;
+    const resolvedSportKey = (typeof sportKey === 'string' && sportKey.trim()) ? sportKey.trim() : SPORT_KEYS[league];
+    if (!resolvedSportKey) return res.status(400).json({ error: 'sportKey o league requerido' });
+    const url = `https://api.the-odds-api.com/v4/sports/${resolvedSportKey}/events?apiKey=${process.env.ODDS_API_KEY}&dateFormat=iso`;
     const resp = await axios.get(url);
-    const fixtures = resp.data.map(e => ({
-      id: e.id, home: e.home_team, away: e.away_team,
-      time: e.commence_time, league
-    }));
+    const fixtures = (Array.isArray(resp.data) ? resp.data : [])
+      .filter((e) => e && e.home_team && e.away_team && e.commence_time)
+      .map(e => ({
+        id: e.id,
+        home: e.home_team,
+        away: e.away_team,
+        time: e.commence_time,
+        league: league || e.sport_title || resolvedSportKey,
+        sportKey: resolvedSportKey
+      }));
     res.json(fixtures);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -312,9 +336,9 @@ app.post('/api/admin/clean-db', async (req, res) => {
 const Anthropic = require('@anthropic-ai/sdk');
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-async function getMatchScore(league, home, away) {
+async function getMatchScore(league, home, away, explicitSportKey) {
   try {
-    const sportKey = SPORT_KEYS[league];
+    const sportKey = explicitSportKey || SPORT_KEYS[league];
     if (!sportKey) return null;
     const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/scores?apiKey=${process.env.ODDS_API_KEY}&daysFrom=3`;
     const resp = await axios.get(url);
@@ -350,7 +374,7 @@ async function runPickAnalysis() {
     for (const pick of picks) {
       const parts = pick.match.split(' vs ');
       if (parts.length < 2) continue;
-      const score = await getMatchScore(pick.league, parts[0].trim(), parts[1].trim());
+      const score = await getMatchScore(pick.league, parts[0].trim(), parts[1].trim(), pick.sportKey);
       if (!score?.completed) continue;
       const analysis = await analyzeWithClaude(pick, score);
       if (analysis) {
@@ -374,7 +398,7 @@ app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
     const parts = pick.match.split(' vs ');
     if (parts.length < 2) return res.status(400).json({ error: 'Invalid match format' });
-    const score = await getMatchScore(pick.league, parts[0].trim(), parts[1].trim());
+    const score = await getMatchScore(pick.league, parts[0].trim(), parts[1].trim(), pick.sportKey);
     if (!score) return res.status(404).json({ error: 'Score not found' });
     const analysis = await analyzeWithClaude(pick, score);
     if (analysis) { await Pick.findByIdAndUpdate(pick._id, { aiAnalysis: analysis }); res.json({ success: true, analysis }); }
