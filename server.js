@@ -427,6 +427,11 @@ const normalizeCheckoutSessionId = (value) => {
 };
 
 const isValidCheckoutSessionId = (value) => /^cs_(test|live)_[^\s]+$/.test(value);
+const hasPickBuyerAccess = async (pickId, userId) => {
+  if (!pickId || !userId) return false;
+  const existingPurchase = await Pick.exists({ _id: pickId, buyers: userId });
+  return Boolean(existingPurchase);
+};
 
 app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => {
   try {
@@ -436,11 +441,13 @@ app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => 
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
 
     const isOwner = String(pick.tipsterId) === String(req.user.id);
-    const isPurchased = pick.buyers?.some((b) => String(b) === String(req.user.id));
+    const isPurchased = await hasPickBuyerAccess(pick._id, req.user.id);
     const cents = normalizeUsdCents(pick.price);
 
     if (isOwner || isPurchased || cents === 0) {
-      await Pick.findByIdAndUpdate(pickId, { $addToSet: { buyers: req.user.id } });
+      if (!isOwner && !isPurchased) {
+        await Pick.findByIdAndUpdate(pickId, { $addToSet: { buyers: req.user.id } });
+      }
       const unlocked = await Pick.findById(pickId);
       return res.json({ success: true, free: true, alreadyUnlocked: true, pick: unlocked });
     }
@@ -509,7 +516,10 @@ app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) =>
     }
     if (session.metadata?.flow !== 'pick') return res.status(400).json({ error: 'La sesión no corresponde a compra de pick' });
 
-    if (session.metadata?.userId && String(session.metadata.userId) !== String(req.user.id)) {
+    if (!session.metadata?.userId) {
+      return res.status(400).json({ error: 'La sesión no contiene usuario asociado' });
+    }
+    if (String(session.metadata.userId) !== String(req.user.id)) {
       return res.status(403).json({ error: 'La sesión no pertenece al usuario autenticado' });
     }
     const targetPickId = session.metadata?.pickId;
@@ -592,7 +602,10 @@ app.post('/api/stripe/pro/confirm-checkout-session', auth, async (req, res) => {
     }
     if (session.metadata?.flow !== 'pro') return res.status(400).json({ error: 'La sesión no corresponde a membresía Pro' });
 
-    if (session.metadata?.userId && String(session.metadata.userId) !== String(req.user.id)) {
+    if (!session.metadata?.userId) {
+      return res.status(400).json({ error: 'La sesión no contiene usuario asociado' });
+    }
+    if (String(session.metadata.userId) !== String(req.user.id)) {
       return res.status(403).json({ error: 'La sesión no pertenece al usuario autenticado' });
     }
 
@@ -613,7 +626,7 @@ app.get('/api/picks/:id/full', auth, async (req, res) => {
     const pick = await Pick.findById(req.params.id);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
     const isOwner = String(pick.tipsterId) === String(req.user.id);
-    const isPurchased = pick.buyers?.some((b) => String(b) === String(req.user.id));
+    const isPurchased = await hasPickBuyerAccess(pick._id, req.user.id);
     const isFree = normalizeUsdCents(pick.price) === 0;
     const isAdmin = req.user.role === 'admin';
     if (!isOwner && !isPurchased && !isFree && !isAdmin) return res.status(403).json({ error: 'No tienes acceso' });
