@@ -454,13 +454,24 @@ app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => 
     const isOwner = String(pick.tipsterId) === String(req.user.id);
     const isPurchased = await hasPickBuyerAccess(pick._id, req.user.id);
     const cents = normalizeUsdCents(pick.price);
+    const isFree = cents === 0;
 
-    if (isOwner || isPurchased || cents === 0) {
-      if (!isOwner && !isPurchased && cents === 0) {
+    if (isOwner && !isFree) {
+      return res.status(403).json({ error: 'No puedes comprar tu propio pick' });
+    }
+
+    if (isPurchased || isFree) {
+      if (!isPurchased && isFree) {
         await Pick.findByIdAndUpdate(pickId, { $addToSet: { buyers: req.user.id } });
       }
       const unlocked = await Pick.findById(pickId);
-      return res.json({ success: true, free: cents === 0, alreadyUnlocked: true, pick: unlocked });
+      return res.json({
+        success: true,
+        free: isFree,
+        alreadyUnlocked: true,
+        unlockReason: isPurchased ? 'purchased' : 'free',
+        pick: unlocked
+      });
     }
 
     const urls = getUserBaseUrlFromRequest(req);
