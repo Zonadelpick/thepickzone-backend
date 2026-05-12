@@ -41,7 +41,7 @@ const UserSchema = new mongoose.Schema({
   name:       { type: String, required: true },
   email:      { type: String, required: true, unique: true },
   password:   { type: String, required: true },
-  role:       { type: String, default: 'basic', enum: ['basic','pro','admin'] },
+  role:       { type: String, default: 'basic', enum: ['basic','pro','tipster','admin'] },
   avatar:     { type: String },
   bio:        { type: String },
   username:   { type: String },
@@ -53,10 +53,70 @@ const UserSchema = new mongoose.Schema({
   pushPicks:  { type: Number, default: 0 },
   avgOdds:    { type: Number, default: 0 },
   balance:    { type: Number, default: 0 },
+  bankClabeMasked: { type: String, default: '' },
+  bankClabeLast4: { type: String, default: '' },
+  bankAccountHolder: { type: String, default: '' },
+  bankName: { type: String, default: '' },
+  stripeConnectedAccountId: { type: String, default: '' },
+  stripeExternalAccountId: { type: String, default: '' },
+  stripePayoutReady: { type: Boolean, default: false },
+  stripePayoutStatus: { type: String, default: 'not_configured' },
+  stripeLastTransferId: { type: String, default: '' },
+  stripeLastPayoutAt: { type: Date },
   proExpiry:  { type: Date },
   createdAt:  { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', UserSchema);
+const PickBetSchema = new mongoose.Schema({
+  betType: { type: String },
+  marketType: { type: String },
+  marketKey: { type: String },
+  selection: { type: String },
+  selectionLabel: { type: String },
+  side: { type: String },
+  line: { type: Number },
+  playerName: { type: String },
+  statType: { type: String },
+  eventId: { type: String },
+  eventDate: { type: String },
+  homeTeam: { type: String },
+  awayTeam: { type: String },
+  bookmaker: { type: String },
+  source: { type: String, default: 'manual' },
+  confidence: { type: Number, default: 0 },
+  sportKey: { type: String },
+  sport: { type: String }
+}, { _id: false, strict: false });
+
+const PickVerificationEvidenceSchema = new mongoose.Schema({
+  provider: { type: String },
+  type: { type: String },
+  detail: { type: String },
+  value: { type: mongoose.Schema.Types.Mixed },
+  raw: { type: mongoose.Schema.Types.Mixed },
+  at: { type: Date, default: Date.now }
+}, { _id: false, strict: false });
+
+const PickVerificationSchema = new mongoose.Schema({
+  status: { type: String, default: 'not_started' },
+  preliminaryResult: { type: String },
+  confidence: { type: Number, default: 0 },
+  needsReview: { type: Boolean, default: false },
+  summary: { type: String },
+  engineVersion: { type: String, default: 'v2-ocr-props-20260512' },
+  lastAnalyzedAt: { type: Date },
+  lastClosedAt: { type: Date },
+  closedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  ocr: {
+    status: { type: String, default: 'not_attempted' },
+    confidence: { type: Number, default: 0 },
+    parsedAt: { type: Date },
+    warnings: [{ type: String }],
+    raw: { type: mongoose.Schema.Types.Mixed }
+  },
+  evidence: [PickVerificationEvidenceSchema],
+  providerTrace: [{ type: mongoose.Schema.Types.Mixed }]
+}, { _id: false, strict: false });
 
 const PickSchema = new mongoose.Schema({
   tipster:    { type: String, required: true },
@@ -74,6 +134,8 @@ const PickSchema = new mongoose.Schema({
   result:     { type: String, default: 'pending', enum: ['pending','won','lost','void'] },
   buyers:     [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   downloadCount: { type: Number, default: 0 },
+  bet:        { type: PickBetSchema, default: () => ({ source: 'manual' }) },
+  verification: { type: PickVerificationSchema, default: () => ({}) },
   aiAnalysis: { type: Object },
   createdAt:  { type: Date, default: Date.now }
 });
@@ -89,6 +151,25 @@ const PurchaseSchema = new mongoose.Schema({
 });
 PurchaseSchema.index({ pickId: 1, buyerId: 1 }, { unique: true });
 const Purchase = mongoose.model('Purchase', PurchaseSchema);
+
+const WeeklyTipsterPayoutSchema = new mongoose.Schema({
+  tipsterId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  weekStart: { type: Date, required: true },
+  weekEnd: { type: Date, required: true },
+  grossCents: { type: Number, default: 0 },
+  payoutCents: { type: Number, default: 0 },
+  platformFeeCents: { type: Number, default: 0 },
+  salesCount: { type: Number, default: 0 },
+  status: { type: String, enum: ['pending', 'processing', 'paid', 'failed'], default: 'pending' },
+  stripeTransferId: { type: String, default: '' },
+  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  approvedAt: { type: Date },
+  errorMessage: { type: String, default: '' },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+WeeklyTipsterPayoutSchema.index({ tipsterId: 1, weekStart: 1, weekEnd: 1 }, { unique: true });
+const WeeklyTipsterPayout = mongoose.model('WeeklyTipsterPayout', WeeklyTipsterPayoutSchema);
 
 const parsePositiveNumber = (value, fallback = 0) => {
   const parsed = Number(value);
@@ -205,24 +286,298 @@ const appendQueryParams = (baseUrl, params) => {
   return url.toString();
 };
 
+const normalizeTextField = (value, maxLength) => {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim().replace(/\s+/g, ' ');
+  return trimmed.slice(0, maxLength);
+};
+
+const sanitizeUsername = (value) => {
+  if (typeof value !== 'string') return undefined;
+  return value.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '').slice(0, 24);
+};
+
+const buildDefaultUsername = (name, email) => {
+  const fromName = sanitizeUsername(name || '');
+  if (fromName) return fromName;
+  const fromEmail = sanitizeUsername(String(email || '').split('@')[0] || '');
+  if (fromEmail) return fromEmail;
+  return `tpz${Date.now().toString(36)}`;
+};
+
+const resolveAvailableUsername = async (desiredUsername, excludeUserId = null) => {
+  const base = sanitizeUsername(desiredUsername || '');
+  if (!base) return null;
+
+  const queryBase = excludeUserId ? { _id: { $ne: excludeUserId } } : {};
+  let candidate = base;
+  let suffix = 1;
+
+  while (suffix <= 500) {
+    const exists = await User.findOne({ ...queryBase, username: candidate }).select('_id');
+    if (!exists) return candidate;
+    const suffixText = String(suffix);
+    const maxBaseLength = Math.max(1, 24 - suffixText.length - 1);
+    candidate = `${base.slice(0, maxBaseLength)}-${suffixText}`;
+    suffix += 1;
+  }
+
+  return `${base.slice(0, 16)}-${Date.now().toString(36).slice(-7)}`.slice(0, 24);
+};
+
+const CLABE_WEIGHTS = [3, 7, 1];
+
+const normalizeDigits = (value) => String(value || '').replace(/\D+/g, '');
+
+const isValidClabe = (clabeValue) => {
+  const clabe = normalizeDigits(clabeValue);
+  if (!/^\d{18}$/.test(clabe)) return false;
+  const expectedDigit = clabe
+    .slice(0, 17)
+    .split('')
+    .reduce((acc, digit, index) => acc + ((Number(digit) * CLABE_WEIGHTS[index % 3]) % 10), 0);
+  const checkDigit = (10 - (expectedDigit % 10)) % 10;
+  return checkDigit === Number(clabe[17]);
+};
+
+const maskClabe = (clabeValue) => {
+  const digits = normalizeDigits(clabeValue);
+  if (digits.length < 4) return '';
+  return `**************${digits.slice(-4)}`;
+};
+
+const centsToAmount = (centsValue) => {
+  const cents = Number(centsValue);
+  if (!Number.isFinite(cents)) return 0;
+  return Number((cents / 100).toFixed(2));
+};
+
+const resolveWeekRange = (weekOffset = 0) => {
+  const now = new Date();
+  const normalizedOffset = Number.isFinite(Number(weekOffset)) ? Math.max(-52, Math.min(52, Number(weekOffset))) : 0;
+  const weekStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+  const currentDay = weekStart.getUTCDay();
+  const deltaToMonday = currentDay === 0 ? -6 : 1 - currentDay;
+  weekStart.setUTCDate(weekStart.getUTCDate() + deltaToMonday + (normalizedOffset * 7));
+  const weekEnd = new Date(weekStart);
+  weekEnd.setUTCDate(weekEnd.getUTCDate() + 7);
+  return { weekStart, weekEnd };
+};
+
+async function ensureTipsterStripeAccount(userDoc) {
+  const existingAccountId = toSafeString(userDoc?.stripeConnectedAccountId);
+  if (existingAccountId) return existingAccountId;
+  const account = await stripe.accounts.create({
+    type: 'custom',
+    country: 'MX',
+    email: userDoc?.email || undefined,
+    business_type: 'individual',
+    capabilities: { transfers: { requested: true } },
+    settings: { payouts: { schedule: { interval: 'manual' } } },
+    metadata: { tpzUserId: String(userDoc?._id || '') }
+  });
+  return toSafeString(account?.id);
+}
+
+async function configureTipsterBankDestination(userDoc, { clabe, accountHolder, bankName }) {
+  const clabeDigits = normalizeDigits(clabe);
+  if (!isValidClabe(clabeDigits)) throw new Error('CLABE inválida');
+  const stripeAccountId = await ensureTipsterStripeAccount(userDoc);
+  const holder = toSafeString(accountHolder || userDoc?.name || 'Tipster');
+  const token = await stripe.tokens.create({
+    bank_account: {
+      country: 'MX',
+      currency: 'mxn',
+      account_holder_name: holder,
+      account_holder_type: 'individual',
+      account_number: clabeDigits
+    }
+  });
+
+  const currentExternalId = toSafeString(userDoc?.stripeExternalAccountId);
+  if (currentExternalId) {
+    try {
+      await stripe.accounts.deleteExternalAccount(stripeAccountId, currentExternalId);
+    } catch {}
+  }
+
+  const externalAccount = await stripe.accounts.createExternalAccount(stripeAccountId, {
+    external_account: token.id,
+    default_for_currency: true
+  });
+  const accountSnapshot = await stripe.accounts.retrieve(stripeAccountId);
+  const payoutReady = Boolean(
+    accountSnapshot?.payouts_enabled ||
+    accountSnapshot?.capabilities?.transfers === 'active'
+  );
+  return {
+    bankClabeMasked: maskClabe(clabeDigits),
+    bankClabeLast4: clabeDigits.slice(-4),
+    bankAccountHolder: holder,
+    bankName: toSafeString(bankName),
+    stripeConnectedAccountId: stripeAccountId,
+    stripeExternalAccountId: toSafeString(externalAccount?.id),
+    stripePayoutReady: payoutReady,
+    stripePayoutStatus: payoutReady ? 'configured' : 'pending_verification'
+  };
+}
+
+function formatWeeklyPayoutEntry(recordDoc, tipsterDoc) {
+  return {
+    _id: String(recordDoc?._id || ''),
+    tipsterId: String(recordDoc?.tipsterId || tipsterDoc?._id || ''),
+    tipsterName: toSafeString(tipsterDoc?.name),
+    tipsterEmail: toSafeString(tipsterDoc?.email),
+    bankClabeMasked: toSafeString(tipsterDoc?.bankClabeMasked),
+    bankAccountHolder: toSafeString(tipsterDoc?.bankAccountHolder),
+    bankName: toSafeString(tipsterDoc?.bankName),
+    stripeConnectedAccountId: toSafeString(tipsterDoc?.stripeConnectedAccountId),
+    stripePayoutReady: Boolean(tipsterDoc?.stripePayoutReady),
+    status: toSafeString(recordDoc?.status) || 'pending',
+    salesCount: Number(recordDoc?.salesCount || 0),
+    grossAmount: centsToAmount(recordDoc?.grossCents || 0),
+    payoutAmount: centsToAmount(recordDoc?.payoutCents || 0),
+    platformFeeAmount: centsToAmount(recordDoc?.platformFeeCents || 0),
+    stripeTransferId: toSafeString(recordDoc?.stripeTransferId),
+    approvedAt: recordDoc?.approvedAt || null,
+    errorMessage: toSafeString(recordDoc?.errorMessage),
+    weekStart: recordDoc?.weekStart || null,
+    weekEnd: recordDoc?.weekEnd || null
+  };
+}
+
+async function buildWeeklyPayoutSummary(weekOffset = 0) {
+  const { weekStart, weekEnd } = resolveWeekRange(weekOffset);
+  const proUsers = await User.find({ role: { $in: ['pro', 'tipster'] } }).select('name email bankClabeMasked bankAccountHolder bankName stripeConnectedAccountId stripePayoutReady stripePayoutStatus');
+  const purchases = await Purchase.find({ createdAt: { $gte: weekStart, $lt: weekEnd } }).select('pickId amountCents currency createdAt');
+  const pickIds = Array.from(new Set(purchases.map((item) => String(item.pickId || '')).filter(Boolean)));
+  const picks = pickIds.length > 0
+    ? await Pick.find({ _id: { $in: pickIds } }).select('_id tipsterId price')
+    : [];
+  const pickById = new Map(picks.map((pickDoc) => [String(pickDoc._id), pickDoc]));
+  const totalsByTipster = new Map();
+
+  purchases.forEach((purchaseDoc) => {
+    const currency = toSafeString(purchaseDoc?.currency || 'usd').toLowerCase();
+    if (currency !== 'usd') return;
+    const pickDoc = pickById.get(String(purchaseDoc?.pickId || ''));
+    const tipsterId = String(pickDoc?.tipsterId || '');
+    if (!tipsterId) return;
+    const amountCents = Number(purchaseDoc?.amountCents) > 0
+      ? Number(purchaseDoc.amountCents)
+      : normalizeUsdCents(pickDoc?.price || 0);
+    if (!Number.isFinite(amountCents) || amountCents <= 0) return;
+    const current = totalsByTipster.get(tipsterId) || { grossCents: 0, salesCount: 0 };
+    current.grossCents += amountCents;
+    current.salesCount += 1;
+    totalsByTipster.set(tipsterId, current);
+  });
+
+  const existingPayouts = await WeeklyTipsterPayout.find({ weekStart, weekEnd });
+  const payoutByTipster = new Map(existingPayouts.map((record) => [String(record.tipsterId), record]));
+  const formattedPayouts = [];
+
+  for (const tipster of proUsers) {
+    const tipsterId = String(tipster._id);
+    const totals = totalsByTipster.get(tipsterId) || { grossCents: 0, salesCount: 0 };
+    const hasExisting = payoutByTipster.has(tipsterId);
+    if (totals.grossCents <= 0 && !hasExisting) continue;
+
+    const payoutCents = Math.round(totals.grossCents * 0.9);
+    const platformFeeCents = Math.max(0, totals.grossCents - payoutCents);
+    let payoutDoc = payoutByTipster.get(tipsterId) || null;
+
+    if (!payoutDoc && totals.grossCents > 0) {
+      payoutDoc = await WeeklyTipsterPayout.create({
+        tipsterId: tipster._id,
+        weekStart,
+        weekEnd,
+        grossCents: totals.grossCents,
+        payoutCents,
+        platformFeeCents,
+        salesCount: totals.salesCount,
+        status: 'pending',
+        updatedAt: new Date()
+      });
+    } else if (payoutDoc && !['paid', 'processing'].includes(payoutDoc.status)) {
+      payoutDoc = await WeeklyTipsterPayout.findByIdAndUpdate(
+        payoutDoc._id,
+        {
+          grossCents: totals.grossCents,
+          payoutCents,
+          platformFeeCents,
+          salesCount: totals.salesCount,
+          updatedAt: new Date()
+        },
+        { new: true }
+      );
+    }
+
+    if (payoutDoc) formattedPayouts.push(formatWeeklyPayoutEntry(payoutDoc, tipster));
+  }
+
+  const totals = formattedPayouts.reduce((acc, row) => {
+    acc.grossAmount += row.grossAmount;
+    acc.payoutAmount += row.payoutAmount;
+    acc.platformFeeAmount += row.platformFeeAmount;
+    acc.salesCount += row.salesCount;
+    return acc;
+  }, { grossAmount: 0, payoutAmount: 0, platformFeeAmount: 0, salesCount: 0 });
+
+  return {
+    week: {
+      start: weekStart,
+      end: weekEnd,
+      label: `${weekStart.toLocaleDateString('es-MX')} - ${new Date(weekEnd.getTime() - 1).toLocaleDateString('es-MX')}`
+    },
+    totals: {
+      ...totals,
+      tipsters: formattedPayouts.length
+    },
+    payouts: formattedPayouts
+  };
+}
+
 // ── AUTH ─────────────────────────────────────────────────────────────────────
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
-    if (!name || !email || !password) return res.status(400).json({ error: 'Faltan campos' });
-    const exists = await User.findOne({ email });
+    const normalizedName = normalizeTextField(name, 60);
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    if (!normalizedName || !normalizedEmail || !password) return res.status(400).json({ error: 'Faltan campos' });
+    const exists = await User.findOne({ email: normalizedEmail });
     if (exists) return res.status(400).json({ error: 'Email ya registrado' });
+    const username = await resolveAvailableUsername(buildDefaultUsername(normalizedName, normalizedEmail));
+    if (!username) return res.status(400).json({ error: 'Username inválido' });
     const hash = await bcrypt.hash(password, 10);
-    const user = await User.create({ name, email, password: hash });
+    const user = await User.create({
+      name: normalizedName,
+      username,
+      email: normalizedEmail,
+      password: hash
+    });
     const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET || 'thepickzone_secret_2026', { expiresIn: '7d' });
-    res.json({ token, user: { _id: user._id, name: user.name, email: user.email, role: user.role } });
+    res.json({
+      token,
+      user: {
+        _id: user._id,
+        name: user.name,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        avatar: user.avatar,
+        bio: user.bio
+      }
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email });
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    if (!normalizedEmail || !password) return res.status(400).json({ error: 'Faltan campos' });
+    const user = await User.findOne({ email: normalizedEmail });
     if (!user) return res.status(400).json({ error: 'Usuario no encontrado' });
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(400).json({ error: 'Contraseña incorrecta' });
@@ -236,6 +591,7 @@ app.post('/api/auth/login', async (req, res) => {
       user: {
         _id: user._id,
         name: user.name,
+        username: user.username,
         email: user.email,
         role: user.role,
         avatar: user.avatar,
@@ -247,7 +603,14 @@ app.post('/api/auth/login', async (req, res) => {
         lostPicks: user.lostPicks,
         pushPicks: user.pushPicks,
         avgOdds: user.avgOdds,
-        proExpiry: user.proExpiry
+        proExpiry: user.proExpiry,
+        bankClabeMasked: user.bankClabeMasked,
+        bankClabeLast4: user.bankClabeLast4,
+        bankAccountHolder: user.bankAccountHolder,
+        bankName: user.bankName,
+        stripeConnectedAccountId: user.stripeConnectedAccountId,
+        stripePayoutReady: user.stripePayoutReady,
+        stripePayoutStatus: user.stripePayoutStatus
       }
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -263,8 +626,75 @@ app.get('/api/auth/me', auth, async (req, res) => {
 
 app.put('/api/auth/profile', auth, async (req, res) => {
   try {
-    const { name, avatar, bio, username } = req.body;
-    const updated = await User.findByIdAndUpdate(req.user.id, { name, avatar, bio, username }, { new: true }).select('-password');
+    const { name, avatar, bio, username, clabe, bankAccountHolder, bankName } = req.body;
+    const currentUser = await User.findById(req.user.id).select('name email stripeConnectedAccountId stripeExternalAccountId bankName bankAccountHolder');
+    if (!currentUser) return res.status(404).json({ error: 'User not found' });
+    const updates = {};
+
+    if (typeof name === 'string') {
+      const normalizedName = normalizeTextField(name, 60);
+      if (!normalizedName) return res.status(400).json({ error: 'Nombre inválido' });
+      updates.name = normalizedName;
+    }
+
+    if (typeof username === 'string') {
+      const normalizedUsername = sanitizeUsername(username);
+      if (!normalizedUsername) return res.status(400).json({ error: 'Username inválido' });
+      const usernameInUse = await User.findOne({ username: normalizedUsername, _id: { $ne: req.user.id } }).select('_id');
+      if (usernameInUse) return res.status(400).json({ error: 'Username no disponible' });
+      updates.username = normalizedUsername;
+    }
+
+    if (typeof bio === 'string') {
+      updates.bio = normalizeTextField(bio, 220) || '';
+    }
+
+    if (typeof avatar === 'string') {
+      const trimmedAvatar = avatar.trim();
+      if (!trimmedAvatar) {
+        updates.avatar = '';
+      } else if (trimmedAvatar.length > 4_000_000) {
+        return res.status(400).json({ error: 'Avatar demasiado grande' });
+      } else if (trimmedAvatar.startsWith('data:image/') || isValidHttpUrl(trimmedAvatar)) {
+        updates.avatar = trimmedAvatar;
+      } else {
+        return res.status(400).json({ error: 'Formato de avatar inválido' });
+      }
+    }
+
+    const requestedPayoutFields = (
+      typeof clabe === 'string' ||
+      typeof bankAccountHolder === 'string' ||
+      typeof bankName === 'string'
+    );
+    if (requestedPayoutFields) {
+      if (!['pro', 'tipster', 'admin'].includes(req.user.role)) {
+        return res.status(403).json({ error: 'Solo usuarios Pro/Tipster/Admin pueden configurar pagos' });
+      }
+      if (typeof bankAccountHolder === 'string') {
+        updates.bankAccountHolder = normalizeTextField(bankAccountHolder, 80) || '';
+      }
+      if (typeof bankName === 'string') {
+        updates.bankName = normalizeTextField(bankName, 80) || '';
+      }
+      if (typeof clabe === 'string' && clabe.trim()) {
+        const setupPayload = await configureTipsterBankDestination(currentUser, {
+          clabe,
+          accountHolder: updates.bankAccountHolder || currentUser.bankAccountHolder || updates.name || currentUser.name,
+          bankName: updates.bankName || currentUser.bankName
+        });
+        Object.assign(updates, setupPayload);
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No hay campos para actualizar' });
+    }
+    const updated = await User.findByIdAndUpdate(req.user.id, updates, { new: true }).select('-password');
+    if (!updated) return res.status(404).json({ error: 'User not found' });
+    if (updates.name && currentUser?.name && currentUser.name !== updates.name) {
+      await Pick.updateMany({ tipsterId: req.user.id }, { $set: { tipster: updates.name } });
+    }
     res.json(updated);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -280,9 +710,27 @@ app.get('/api/picks', async (req, res) => {
 
 app.post('/api/picks', auth, async (req, res) => {
   try {
-    if (!['pro','admin'].includes(req.user.role)) return res.status(403).json({ error: 'Solo tipsters Pro pueden publicar picks' });
-    const pick = await Pick.create({ ...req.body, tipsterId: req.user.id });
-    res.json(pick);
+    if (!['pro','tipster','admin'].includes(req.user.role)) return res.status(403).json({ error: 'Solo tipsters Pro/Tipster pueden publicar picks' });
+    const draftPick = { ...req.body, tipsterId: req.user.id };
+    draftPick.bet = mergeBetData(buildBetFromPick(draftPick), draftPick.bet || {});
+    draftPick.verification = {
+      ...(draftPick.verification || {}),
+      status: 'pending_data',
+      preliminaryResult: 'PENDIENTE',
+      confidence: 0,
+      needsReview: false,
+      summary: 'Esperando análisis preliminar',
+      engineVersion: AI_ENGINE_VERSION
+    };
+    const pick = await Pick.create(draftPick);
+    let enrichedPick = pick;
+    try {
+      const analyzed = await analyzeAndPersistPick(pick, { forceOcr: true });
+      if (analyzed) enrichedPick = analyzed;
+    } catch (analysisError) {
+      console.error('post /api/picks analysis error:', analysisError.message || analysisError);
+    }
+    res.json(enrichedPick);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -310,12 +758,35 @@ app.put('/api/picks/:id/result', auth, requireAdmin, async (req, res) => {
     if (!['won','lost','void','pending'].includes(result)) return res.status(400).json({ error: 'Invalid result' });
     const pick = await Pick.findById(req.params.id);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
-    const updatedPick = await Pick.findByIdAndUpdate(req.params.id, { result }, { new: true });
+    const currentVerification = pick?.verification && typeof pick.verification === 'object' ? pick.verification : {};
+    const verificationPatch = result === 'pending'
+      ? {
+          ...currentVerification,
+          status: pick?.aiAnalysis?.needsReview ? 'needs_review' : 'preliminary_ready',
+          preliminaryResult: pick?.aiAnalysis?.resultado || currentVerification.preliminaryResult || 'PENDIENTE',
+          confidence: pick?.aiAnalysis?.confianza ?? currentVerification.confidence ?? 0,
+          summary: pick?.aiAnalysis?.detalle || currentVerification.summary || 'Pick reabierto por inconformidad',
+          closedBy: null,
+          lastClosedAt: null
+        }
+      : {
+          ...currentVerification,
+          status: 'closed_by_admin',
+          needsReview: false,
+          summary: `Cierre final admin: ${String(result).toUpperCase()}`,
+          closedBy: req.user.id,
+          lastClosedAt: new Date()
+        };
+    const updatedPick = await Pick.findByIdAndUpdate(
+      req.params.id,
+      { result, verification: verificationPatch },
+      { new: true }
+    );
     let tipsterStats = null;
     if (pick.tipsterId) {
       tipsterStats = await recalculateTipsterStats(pick.tipsterId);
     }
-    res.json({ success: true, result: updatedPick?.result || result, tipsterStats });
+    res.json({ success: true, result: updatedPick?.result || result, tipsterStats, pick: updatedPick });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -391,7 +862,7 @@ app.get('/api/fixtures/odds', async (req, res) => {
 // ── TIPSTERS ─────────────────────────────────────────────────────────────────
 app.get('/api/tipsters', async (req, res) => {
   try {
-    const tipsters = await User.find({ role: { $in: ['pro','admin'] } }).select('-password -proExpiry').sort({ createdAt: -1 });
+    const tipsters = await User.find({ role: { $in: ['pro','tipster','admin'] } }).select('-password -proExpiry').sort({ createdAt: -1 });
     res.json(tipsters);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -410,6 +881,90 @@ app.get('/api/admin/users', auth, requireAdmin, async (req, res) => {
     const users = await User.find().select('-password').sort({ createdAt: -1 });
     res.json(users);
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/revenue/weekly-payouts', auth, requireAdmin, async (req, res) => {
+  try {
+    const weekOffsetRaw = Number(req.query.weekOffset ?? 0);
+    const weekOffset = Number.isFinite(weekOffsetRaw) ? weekOffsetRaw : 0;
+    const summary = await buildWeeklyPayoutSummary(weekOffset);
+    res.json(summary);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/revenue/weekly-payouts/:id/approve', auth, requireAdmin, async (req, res) => {
+  try {
+    const payoutId = req.params.id;
+    const payout = await WeeklyTipsterPayout.findById(payoutId);
+    if (!payout) return res.status(404).json({ error: 'Corte semanal no encontrado' });
+    if (payout.status === 'paid') return res.status(400).json({ error: 'Este pago ya fue procesado' });
+    if (payout.status === 'processing') return res.status(400).json({ error: 'Este pago está en procesamiento' });
+    if (Number(payout.payoutCents || 0) <= 0) return res.status(400).json({ error: 'Monto de payout inválido' });
+
+    const tipster = await User.findById(payout.tipsterId).select('name email bankClabeMasked bankAccountHolder bankName stripeConnectedAccountId stripePayoutReady');
+    if (!tipster) return res.status(404).json({ error: 'Tipster no encontrado' });
+    if (!toSafeString(tipster.stripeConnectedAccountId)) {
+      return res.status(400).json({ error: 'El tipster no tiene cuenta Stripe Connect configurada' });
+    }
+    if (!tipster.stripePayoutReady) {
+      return res.status(400).json({ error: 'La cuenta Stripe del tipster aún no está lista para transferencias' });
+    }
+
+    await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
+      status: 'processing',
+      errorMessage: '',
+      updatedAt: new Date()
+    });
+
+    try {
+      const transfer = await stripe.transfers.create({
+        amount: Number(payout.payoutCents),
+        currency: 'usd',
+        destination: tipster.stripeConnectedAccountId,
+        metadata: {
+          tpzPayoutId: String(payout._id),
+          tpzTipsterId: String(tipster._id),
+          weekStart: new Date(payout.weekStart).toISOString(),
+          weekEnd: new Date(payout.weekEnd).toISOString()
+        }
+      });
+
+      await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
+        status: 'paid',
+        stripeTransferId: transfer.id,
+        approvedBy: req.user.id,
+        approvedAt: new Date(),
+        errorMessage: '',
+        updatedAt: new Date()
+      });
+
+      await User.findByIdAndUpdate(tipster._id, {
+        stripeLastTransferId: transfer.id,
+        stripeLastPayoutAt: new Date(),
+        stripePayoutStatus: 'configured',
+        stripePayoutReady: true
+      });
+
+      const refreshed = await WeeklyTipsterPayout.findById(payout._id);
+      res.json({
+        success: true,
+        payout: formatWeeklyPayoutEntry(refreshed, tipster),
+        stripeTransferId: transfer.id
+      });
+    } catch (stripeError) {
+      const errorMessage = toSafeString(stripeError?.message || 'No se pudo procesar el pago en Stripe').slice(0, 400);
+      await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
+        status: 'failed',
+        errorMessage,
+        updatedAt: new Date()
+      });
+      res.status(400).json({ error: errorMessage || 'No se pudo procesar el pago en Stripe' });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/api/admin/picks-pending', auth, requireAdmin, async (req, res) => {
@@ -460,75 +1015,1034 @@ app.post('/api/admin/clean-db', async (req, res) => {
 // ── AI ANALYSIS ───────────────────────────────────────────────────────────────
 const Anthropic = require('@anthropic-ai/sdk');
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const AI_ENGINE_VERSION = 'v2-ocr-props-20260512';
+const APISPORTS_KEY = (process.env.APISPORTS_KEY || process.env.APISPORTS_API_KEY || '').trim();
+const APISPORTS_BASE_URLS = {
+  basketball: (process.env.APISPORTS_BASKETBALL_BASE_URL || 'https://v1.basketball.api-sports.io').trim(),
+  baseball: (process.env.APISPORTS_BASEBALL_BASE_URL || 'https://v1.baseball.api-sports.io').trim(),
+  'american-football': (process.env.APISPORTS_AMERICAN_FOOTBALL_BASE_URL || 'https://v1.american-football.api-sports.io').trim(),
+  football: (process.env.APISPORTS_FOOTBALL_BASE_URL || 'https://v3.football.api-sports.io').trim()
+};
+const SUPPORTED_PROP_SPORTS = new Set(['basketball', 'baseball', 'american-football', 'football']);
+const PROP_STAT_ALIASES = {
+  points: ['points', 'pts', 'point'],
+  rebounds: ['rebounds', 'total_rebounds', 'reb'],
+  assists: ['assists', 'assist'],
+  threes: ['threepoint', 'three_points', '3pt', 'threepoint_goals'],
+  goals: ['goals', 'goal'],
+  shots: ['shots', 'shot'],
+  shots_on_target: ['shots_on_target', 'shots_on_goal', 'shots_on'],
+  saves: ['saves', 'save', 'goalkeeper_saves'],
+  hits: ['hits', 'hit'],
+  runs: ['runs', 'run'],
+  rbi: ['rbi', 'runs_batted_in'],
+  home_runs: ['home_runs', 'homeruns', 'home_run'],
+  strikeouts: ['strikeouts', 'strike_outs', 'k'],
+  passing_yards: ['passing_yards', 'pass_yards'],
+  rushing_yards: ['rushing_yards', 'rush_yards'],
+  receiving_yards: ['receiving_yards', 'rec_yards'],
+  touchdowns: ['touchdowns', 'td']
+};
 
-async function getMatchScore(league, home, away, explicitSportKey) {
+function toSafeString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function toSafeNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function clampNumber(value, min, max, fallback = min) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function normalizeToken(value) {
+  return toSafeString(value).toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeTeamName(value) {
+  return normalizeToken(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, '')
+    .replace(/\b(fc|cf|club|deportivo|the)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function splitMatchTeams(match) {
+  const raw = toSafeString(match);
+  if (!raw) return [null, null];
+  const splitters = [/\s+vs\.?\s+/i, /\s+v\s+/i, /\s+-\s+/];
+  for (const splitter of splitters) {
+    const parts = raw.split(splitter).map((item) => item.trim()).filter(Boolean);
+    if (parts.length >= 2) return [parts[0], parts[1]];
+  }
+  return [null, null];
+}
+
+function scoreNameMatch(expected, candidate) {
+  const e = normalizeTeamName(expected);
+  const c = normalizeTeamName(candidate);
+  if (!e || !c) return 0;
+  if (e === c) return 5;
+  if (c.includes(e) || e.includes(c)) return 4;
+  const eParts = e.split(' ').filter(Boolean);
+  const cParts = c.split(' ').filter(Boolean);
+  const overlap = eParts.filter((part) => cParts.includes(part)).length;
+  return overlap;
+}
+
+function resolveSportKeyFromContext({ sportKey, league, sport }) {
+  const explicitSportKey = toSafeString(sportKey);
+  if (explicitSportKey && explicitSportKey.includes('_')) return explicitSportKey;
+  const leagueKey = SPORT_KEYS[toSafeString(league)];
+  if (leagueKey) return leagueKey;
+  const merged = `${toSafeString(league)} ${toSafeString(sport)} ${explicitSportKey}`.toLowerCase();
+  if (merged.includes('nba')) return 'basketball_nba';
+  if (merged.includes('mlb') || merged.includes('baseball')) return 'baseball_mlb';
+  if (merged.includes('nfl') || merged.includes('football americano') || merged.includes('american football')) return 'americanfootball_nfl';
+  if (merged.includes('soccer') || merged.includes('futbol') || merged.includes('football')) return 'soccer_epl';
+  return explicitSportKey || '';
+}
+
+function resolveSecondarySportCode({ sportKey, sport, league }) {
+  const merged = `${toSafeString(sportKey)} ${toSafeString(sport)} ${toSafeString(league)}`.toLowerCase();
+  if (merged.includes('basketball') || merged.includes('nba')) return 'basketball';
+  if (merged.includes('baseball') || merged.includes('mlb')) return 'baseball';
+  if (merged.includes('americanfootball') || merged.includes('nfl')) return 'american-football';
+  if (merged.includes('soccer') || merged.includes('futbol')) return 'football';
+  return '';
+}
+
+function normalizeSide(value) {
+  const token = normalizeToken(value);
+  if (!token) return '';
+  if (token.includes('home') || token.includes('local')) return 'home';
+  if (token.includes('away') || token.includes('visit')) return 'away';
+  if (token.includes('over') || token.includes('mas')) return 'over';
+  if (token.includes('under') || token.includes('menos')) return 'under';
+  if (token.includes('yes') || token.includes('si')) return 'yes';
+  if (token.includes('no')) return 'no';
+  return token.replace(/\s+/g, '_');
+}
+
+function normalizeMarketType(value, betType = '') {
+  const token = normalizeToken(value);
+  const normalizedBetType = normalizeToken(betType);
+  if (normalizedBetType === 'parlay') return 'parlay';
+  if (token.includes('player') || token.includes('prop')) return 'player_prop';
+  if (token.includes('spread') || token.includes('handicap')) return 'spread';
+  if (token.includes('team total')) return 'team_total';
+  if (token.includes('total') || token.includes('over') || token.includes('under')) return 'total';
+  if (token.includes('moneyline') || token.includes('ganador') || token.includes('winner')) return 'moneyline';
+  if (token.includes('both teams to score') || token.includes('btts')) return 'both_teams_to_score';
+  return token || 'moneyline';
+}
+
+function normalizeStatType(value) {
+  const token = normalizeToken(value).replace(/\s+/g, '_');
+  if (!token) return '';
+  const aliases = Object.entries(PROP_STAT_ALIASES);
+  for (const [statType, possibleAliases] of aliases) {
+    if (token === statType) return statType;
+    if (possibleAliases.some((alias) => token.includes(alias))) return statType;
+  }
+  return token;
+}
+
+function extractJsonObject(text) {
+  const raw = toSafeString(text);
+  if (!raw) return null;
+  const first = raw.indexOf('{');
+  const last = raw.lastIndexOf('}');
+  if (first < 0 || last < 0 || last <= first) return null;
   try {
-    const sportKey = explicitSportKey || SPORT_KEYS[league];
-    if (!sportKey) return null;
-    const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/scores?apiKey=${process.env.ODDS_API_KEY}&daysFrom=3`;
-    const resp = await axios.get(url);
-    const match = resp.data.find(m => {
-      const h = m.home_team?.toLowerCase(); const a = m.away_team?.toLowerCase();
-      const ph = home.toLowerCase(); const pa = away.toLowerCase();
-      return (h?.includes(ph)||ph.includes(h||'')) && (a?.includes(pa)||pa.includes(a||''));
+    return JSON.parse(raw.slice(first, last + 1));
+  } catch {
+    return null;
+  }
+}
+
+function parseDataUrlImage(dataUrl) {
+  const match = toSafeString(dataUrl).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) return null;
+  return { mediaType: match[1], data: match[2] };
+}
+
+function buildProviderTrace(provider, endpoint, ok, message, extra = {}) {
+  return {
+    provider,
+    endpoint,
+    ok: Boolean(ok),
+    message: toSafeString(message),
+    at: new Date().toISOString(),
+    ...extra
+  };
+}
+
+function formatDateYmd(dateLike) {
+  const parsed = new Date(dateLike);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toISOString().slice(0, 10);
+}
+
+function buildDateCandidates(eventDate) {
+  const baseDate = formatDateYmd(eventDate) || formatDateYmd(new Date());
+  const parsed = new Date(baseDate);
+  const candidates = [baseDate];
+  [-1, 1].forEach((offset) => {
+    const copy = new Date(parsed);
+    copy.setDate(copy.getDate() + offset);
+    candidates.push(formatDateYmd(copy));
+  });
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
+function buildBetFromPick(pickLike = {}) {
+  const rawBet = (pickLike && typeof pickLike.bet === 'object' && pickLike.bet) ? pickLike.bet : {};
+  const [matchHome, matchAway] = splitMatchTeams(rawBet.match || pickLike.match);
+  const betType = normalizeToken(rawBet.betType || pickLike.betType || (String(pickLike.league || '').toLowerCase().includes('parlay') ? 'parlay' : 'straight'));
+  const marketType = normalizeMarketType(rawBet.marketType || rawBet.marketKey || rawBet.selection || '', betType);
+  return {
+    betType,
+    marketType,
+    marketKey: toSafeString(rawBet.marketKey || rawBet.marketType),
+    selection: toSafeString(rawBet.selection || pickLike.selection),
+    selectionLabel: toSafeString(rawBet.selectionLabel || pickLike.selectionLabel),
+    side: normalizeSide(rawBet.side || pickLike.side || rawBet.selection),
+    line: toSafeNumber(rawBet.line ?? pickLike.line),
+    playerName: toSafeString(rawBet.playerName || pickLike.playerName),
+    statType: normalizeStatType(rawBet.statType || pickLike.statType || rawBet.marketKey),
+    eventId: toSafeString(rawBet.eventId || pickLike.eventId),
+    eventDate: toSafeString(rawBet.eventDate || pickLike.time),
+    homeTeam: toSafeString(rawBet.homeTeam || matchHome),
+    awayTeam: toSafeString(rawBet.awayTeam || matchAway),
+    bookmaker: toSafeString(rawBet.bookmaker || pickLike.bookmaker),
+    source: toSafeString(rawBet.source || 'manual'),
+    confidence: clampNumber(rawBet.confidence ?? 0, 0, 100, 0),
+    sportKey: resolveSportKeyFromContext({
+      sportKey: rawBet.sportKey || pickLike.sportKey,
+      league: rawBet.league || pickLike.league,
+      sport: rawBet.sport || pickLike.sport
+    }),
+    sport: toSafeString(rawBet.sport || pickLike.sport)
+  };
+}
+
+function mergeBetData(baseBet, incomingBet = {}) {
+  const merged = { ...(baseBet || {}) };
+  const allowedKeys = [
+    'betType', 'marketType', 'marketKey', 'selection', 'selectionLabel', 'side', 'line', 'playerName',
+    'statType', 'eventId', 'eventDate', 'homeTeam', 'awayTeam', 'bookmaker', 'source', 'confidence', 'sportKey', 'sport'
+  ];
+  for (const key of allowedKeys) {
+    const incomingValue = incomingBet?.[key];
+    if (incomingValue === undefined || incomingValue === null || incomingValue === '') continue;
+    merged[key] = incomingValue;
+  }
+  if (baseBet?.source && incomingBet?.source && baseBet.source !== incomingBet.source) {
+    merged.source = `${baseBet.source}+${incomingBet.source}`;
+  }
+  merged.marketType = normalizeMarketType(merged.marketType, merged.betType);
+  merged.side = normalizeSide(merged.side || merged.selection);
+  merged.statType = normalizeStatType(merged.statType || merged.marketKey);
+  merged.confidence = clampNumber(merged.confidence, 0, 100, 0);
+  return merged;
+}
+
+function inferSideFromSelectionLabel(selectionLabel, homeTeam, awayTeam) {
+  const label = toSafeString(selectionLabel);
+  if (!label) return '';
+  const normalized = normalizeTeamName(label);
+  const homeScore = scoreNameMatch(homeTeam, normalized);
+  const awayScore = scoreNameMatch(awayTeam, normalized);
+  if (homeScore > awayScore && homeScore > 0) return 'home';
+  if (awayScore > homeScore && awayScore > 0) return 'away';
+  return '';
+}
+
+function getWinnerSide(homeScore, awayScore) {
+  if (homeScore > awayScore) return 'home';
+  if (awayScore > homeScore) return 'away';
+  return 'draw';
+}
+
+function resolveStandardMarket(bet, score) {
+  const evidence = [];
+  if (!score) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 25,
+      detalle: 'No se pudo obtener marcador oficial para este evento.',
+      needsReview: true,
+      evidence
+    };
+  }
+  if (!score.completed) {
+    return {
+      resultado: 'PENDIENTE',
+      confianza: 15,
+      detalle: 'El evento todavía no está finalizado.',
+      needsReview: false,
+      evidence
+    };
+  }
+  const homeScore = toSafeNumber(score.homeScore);
+  const awayScore = toSafeNumber(score.awayScore);
+  if (homeScore === null || awayScore === null) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 30,
+      detalle: 'Marcador final incompleto en fuente oficial.',
+      needsReview: true,
+      evidence
+    };
+  }
+  const marketType = normalizeMarketType(bet?.marketType, bet?.betType);
+  evidence.push({ provider: 'odds-api', type: 'score', detail: `${score.home} ${homeScore} - ${awayScore} ${score.away}`, value: { homeScore, awayScore } });
+  if (marketType === 'parlay') {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 20,
+      detalle: 'Parlay requiere verificación manual por múltiples selecciones.',
+      needsReview: true,
+      evidence
+    };
+  }
+  if (marketType === 'moneyline') {
+    let expectedSide = normalizeSide(bet?.side || bet?.selection);
+    if (!['home', 'away'].includes(expectedSide)) {
+      expectedSide = inferSideFromSelectionLabel(`${bet?.selectionLabel || ''} ${bet?.selection || ''}`, score.home, score.away);
+    }
+    if (!['home', 'away'].includes(expectedSide)) {
+      return {
+        resultado: 'NECESITA_VERIFICACION',
+        confianza: 35,
+        detalle: 'No se pudo identificar equipo seleccionado en moneyline.',
+        needsReview: true,
+        evidence
+      };
+    }
+    const winnerSide = getWinnerSide(homeScore, awayScore);
+    if (winnerSide === 'draw') {
+      return {
+        resultado: 'VOID',
+        confianza: 80,
+        detalle: 'Empate detectado, market moneyline marcado como VOID.',
+        needsReview: false,
+        evidence
+      };
+    }
+    return {
+      resultado: winnerSide === expectedSide ? 'GANADO' : 'PERDIDO',
+      confianza: 88,
+      detalle: winnerSide === expectedSide ? 'Moneyline coincide con marcador final.' : 'Moneyline no coincide con marcador final.',
+      needsReview: false,
+      evidence
+    };
+  }
+  if (marketType === 'spread') {
+    const line = toSafeNumber(bet?.line);
+    let side = normalizeSide(bet?.side || bet?.selection);
+    if (!['home', 'away'].includes(side)) {
+      side = inferSideFromSelectionLabel(`${bet?.selectionLabel || ''} ${bet?.selection || ''}`, score.home, score.away);
+    }
+    if (line === null || !['home', 'away'].includes(side)) {
+      return {
+        resultado: 'NECESITA_VERIFICACION',
+        confianza: 35,
+        detalle: 'Spread requiere lado (home/away) y línea numérica.',
+        needsReview: true,
+        evidence
+      };
+    }
+    const adjustedHome = side === 'home' ? homeScore + line : homeScore;
+    const adjustedAway = side === 'away' ? awayScore + line : awayScore;
+    if (adjustedHome === adjustedAway) {
+      return {
+        resultado: 'VOID',
+        confianza: 82,
+        detalle: 'Resultado exacto al spread, se marca como VOID.',
+        needsReview: false,
+        evidence
+      };
+    }
+    const won = (side === 'home' && adjustedHome > adjustedAway) || (side === 'away' && adjustedAway > adjustedHome);
+    return {
+      resultado: won ? 'GANADO' : 'PERDIDO',
+      confianza: 86,
+      detalle: won ? 'Spread cubierto según marcador final.' : 'Spread no cubierto según marcador final.',
+      needsReview: false,
+      evidence
+    };
+  }
+  if (marketType === 'total') {
+    const line = toSafeNumber(bet?.line);
+    const side = normalizeSide(bet?.side || bet?.selection);
+    if (line === null || !['over', 'under'].includes(side)) {
+      return {
+        resultado: 'NECESITA_VERIFICACION',
+        confianza: 35,
+        detalle: 'Total requiere línea numérica y selección over/under.',
+        needsReview: true,
+        evidence
+      };
+    }
+    const total = homeScore + awayScore;
+    if (total === line) {
+      return {
+        resultado: 'VOID',
+        confianza: 84,
+        detalle: `Total exacto (${total}) igual a línea (${line}).`,
+        needsReview: false,
+        evidence
+      };
+    }
+    const won = (side === 'over' && total > line) || (side === 'under' && total < line);
+    return {
+      resultado: won ? 'GANADO' : 'PERDIDO',
+      confianza: 86,
+      detalle: won ? `Total ${side} acertado (${total} vs ${line}).` : `Total ${side} fallado (${total} vs ${line}).`,
+      needsReview: false,
+      evidence
+    };
+  }
+  if (marketType === 'team_total') {
+    const line = toSafeNumber(bet?.line);
+    let side = normalizeSide(bet?.side || bet?.selection);
+    if (!['home', 'away'].includes(side)) {
+      side = inferSideFromSelectionLabel(`${bet?.selectionLabel || ''} ${bet?.selection || ''}`, score.home, score.away);
+    }
+    const ouSide = normalizeSide(bet?.selection || bet?.side);
+    if (line === null || !['home', 'away'].includes(side) || !['over', 'under'].includes(ouSide)) {
+      return {
+        resultado: 'NECESITA_VERIFICACION',
+        confianza: 35,
+        detalle: 'Team total requiere equipo, over/under y línea.',
+        needsReview: true,
+        evidence
+      };
+    }
+    const selectedScore = side === 'home' ? homeScore : awayScore;
+    if (selectedScore === line) {
+      return {
+        resultado: 'VOID',
+        confianza: 82,
+        detalle: 'Team total exacto, se marca VOID.',
+        needsReview: false,
+        evidence
+      };
+    }
+    const won = (ouSide === 'over' && selectedScore > line) || (ouSide === 'under' && selectedScore < line);
+    return {
+      resultado: won ? 'GANADO' : 'PERDIDO',
+      confianza: 86,
+      detalle: won ? 'Team total acertado.' : 'Team total fallado.',
+      needsReview: false,
+      evidence
+    };
+  }
+  if (marketType === 'both_teams_to_score') {
+    const side = normalizeSide(bet?.side || bet?.selection);
+    if (!['yes', 'no'].includes(side)) {
+      return {
+        resultado: 'NECESITA_VERIFICACION',
+        confianza: 35,
+        detalle: 'BTTS requiere selección sí/no.',
+        needsReview: true,
+        evidence
+      };
+    }
+    const bothScored = homeScore > 0 && awayScore > 0;
+    const won = (side === 'yes' && bothScored) || (side === 'no' && !bothScored);
+    return {
+      resultado: won ? 'GANADO' : 'PERDIDO',
+      confianza: 87,
+      detalle: won ? 'BTTS validado con marcador oficial.' : 'BTTS no coincide con marcador oficial.',
+      needsReview: false,
+      evidence
+    };
+  }
+  return {
+    resultado: 'NECESITA_VERIFICACION',
+    confianza: 30,
+    detalle: `Mercado no soportado automáticamente: ${marketType || 'desconocido'}.`,
+    needsReview: true,
+    evidence
+  };
+}
+
+async function extractTicketBetWithVision(pick, currentBet) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return { bet: null, meta: { status: 'not_attempted', confidence: 0, warnings: ['ANTHROPIC_API_KEY no configurado'] } };
+  }
+  if (!toSafeString(pick?.ticketImg)) {
+    return { bet: null, meta: { status: 'not_attempted', confidence: 0, warnings: ['Sin ticketImg'] } };
+  }
+  const parsedImage = parseDataUrlImage(pick.ticketImg);
+  if (!parsedImage) {
+    return { bet: null, meta: { status: 'failed', confidence: 0, warnings: ['Formato de imagen no soportado para OCR'] } };
+  }
+  const [homeTeam, awayTeam] = splitMatchTeams(pick.match);
+  const prompt = `Extrae la apuesta del ticket y responde SOLO JSON válido con esta forma:
+{
+  "betType":"straight|parlay|prop",
+  "marketType":"moneyline|spread|total|team_total|player_prop|both_teams_to_score|unknown",
+  "selection":"texto exacto de selección",
+  "selectionLabel":"texto legible",
+  "side":"home|away|over|under|yes|no|unknown",
+  "line":numero_o_null,
+  "playerName":"string_o_vacio",
+  "statType":"points|rebounds|assists|hits|runs|rbi|home_runs|strikeouts|passing_yards|rushing_yards|receiving_yards|touchdowns|goals|shots|shots_on_target|saves|unknown",
+  "bookmaker":"string_o_vacio",
+  "homeTeam":"string_o_vacio",
+  "awayTeam":"string_o_vacio",
+  "sport":"string_o_vacio",
+  "sportKey":"string_o_vacio",
+  "confidence":0-100,
+  "warnings":["..."]
+}
+Contexto pick:
+- match: ${pick.match || ''}
+- league: ${pick.league || ''}
+- sportKey: ${pick.sportKey || ''}
+- home sugerido: ${homeTeam || ''}
+- away sugerido: ${awayTeam || ''}
+Si no sabes un campo, usa null o string vacío según aplique.`;
+  try {
+    const resp = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 600,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: prompt },
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: parsedImage.mediaType,
+              data: parsedImage.data
+            }
+          }
+        ]
+      }]
     });
-    if (!match?.scores) return null;
-    const homeScore = match.scores.find(s=>s.name===match.home_team)?.score;
-    const awayScore = match.scores.find(s=>s.name===match.away_team)?.score;
-    return { home: match.home_team, away: match.away_team, homeScore, awayScore, completed: match.completed };
-  } catch(e) { return null; }
+    const answer = Array.isArray(resp?.content)
+      ? resp.content.map((chunk) => chunk?.text || '').join('\n')
+      : '';
+    const parsed = extractJsonObject(answer);
+    if (!parsed) {
+      return { bet: null, meta: { status: 'failed', confidence: 0, warnings: ['No se pudo parsear JSON de OCR'] } };
+    }
+    const ocrBet = mergeBetData(currentBet, {
+      betType: normalizeToken(parsed.betType),
+      marketType: normalizeMarketType(parsed.marketType, parsed.betType),
+      marketKey: toSafeString(parsed.marketType || parsed.marketKey),
+      selection: toSafeString(parsed.selection),
+      selectionLabel: toSafeString(parsed.selectionLabel),
+      side: normalizeSide(parsed.side || parsed.selection),
+      line: toSafeNumber(parsed.line),
+      playerName: toSafeString(parsed.playerName),
+      statType: normalizeStatType(parsed.statType),
+      eventDate: toSafeString(parsed.eventDate || currentBet?.eventDate),
+      homeTeam: toSafeString(parsed.homeTeam || currentBet?.homeTeam),
+      awayTeam: toSafeString(parsed.awayTeam || currentBet?.awayTeam),
+      bookmaker: toSafeString(parsed.bookmaker),
+      sport: toSafeString(parsed.sport || currentBet?.sport),
+      sportKey: resolveSportKeyFromContext({
+        sportKey: parsed.sportKey || currentBet?.sportKey,
+        league: pick?.league,
+        sport: parsed.sport || currentBet?.sport
+      }),
+      source: 'ocr',
+      confidence: clampNumber(parsed.confidence, 0, 100, 55)
+    });
+    return {
+      bet: ocrBet,
+      meta: {
+        status: 'parsed',
+        confidence: clampNumber(parsed.confidence, 0, 100, 55),
+        warnings: Array.isArray(parsed.warnings) ? parsed.warnings.map((item) => String(item)) : [],
+        raw: { model: 'claude-haiku-4-5-20251001', answer: answer.slice(0, 4000) }
+      }
+    };
+  } catch (error) {
+    return {
+      bet: null,
+      meta: {
+        status: 'failed',
+        confidence: 0,
+        warnings: [error.message || 'Error OCR'],
+        raw: { error: error.message || 'Error OCR' }
+      }
+    };
+  }
 }
 
-async function analyzeWithClaude(pick, score) {
+async function getMatchScore(league, home, away, explicitSportKey, explicitEventId = '') {
   try {
-    const messages = [{ role: 'user', content: `Eres experto verificador de apuestas. Analiza:
-Pick: ${pick.match} | Liga: ${pick.league} | Odds: ${pick.odds}
-Resultado: ${score.home} ${score.homeScore} - ${score.awayScore} ${score.away}
-Responde SOLO JSON: {"resultado":"GANADO|PERDIDO|VOID|NECESITA_VERIFICACION","confianza":0-100,"detalle":"breve"}` }];
-    const resp = await anthropic.messages.create({ model: 'claude-haiku-4-5-20251001', max_tokens: 300, messages });
-    const text = resp.content[0].text;
-    const json = text.match(/\{[\s\S]*\}/);
-    return json ? JSON.parse(json[0]) : null;
-  } catch(e) { return null; }
-}
-
-async function runPickAnalysis() {
-  try {
-    const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
-    const picks = await Pick.find({ result: 'pending', createdAt: { $lt: sixHoursAgo } });
-    for (const pick of picks) {
-      const parts = pick.match.split(' vs ');
-      if (parts.length < 2) continue;
-      const score = await getMatchScore(pick.league, parts[0].trim(), parts[1].trim(), pick.sportKey);
-      if (!score?.completed) continue;
-      const analysis = await analyzeWithClaude(pick, score);
-      if (analysis) {
-        await Pick.findByIdAndUpdate(pick._id, { aiAnalysis: analysis });
-        console.log(`Analyzed: ${pick.match} -> ${analysis.resultado}`);
+    const sportKey = explicitSportKey || resolveSportKeyFromContext({ sportKey: explicitSportKey, league, sport: '' });
+    if (!sportKey || !process.env.ODDS_API_KEY) return null;
+    const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/scores?apiKey=${process.env.ODDS_API_KEY}&daysFrom=4`;
+    const resp = await axios.get(url, { timeout: 12000 });
+    const rows = Array.isArray(resp.data) ? resp.data : [];
+    const normalizedEventId = toSafeString(explicitEventId);
+    let bestMatch = null;
+    let bestScore = -1;
+    for (const row of rows) {
+      if (!row) continue;
+      if (normalizedEventId && String(row.id || '') === normalizedEventId) {
+        bestMatch = row;
+        break;
+      }
+      const homeScore = scoreNameMatch(home, row.home_team);
+      const awayScore = scoreNameMatch(away, row.away_team);
+      const candidateScore = homeScore + awayScore;
+      if (candidateScore > bestScore) {
+        bestScore = candidateScore;
+        bestMatch = row;
       }
     }
-  } catch(e) { console.error('runPickAnalysis error:', e); }
+    if (!bestMatch) return null;
+    const scores = Array.isArray(bestMatch.scores) ? bestMatch.scores : [];
+    const homeScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(bestMatch.home_team));
+    const awayScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(bestMatch.away_team));
+    return {
+      eventId: toSafeString(bestMatch.id),
+      sportKey,
+      home: toSafeString(bestMatch.home_team),
+      away: toSafeString(bestMatch.away_team),
+      homeScore: toSafeNumber(homeScoreEntry?.score),
+      awayScore: toSafeNumber(awayScoreEntry?.score),
+      completed: Boolean(bestMatch.completed),
+      commenceTime: toSafeString(bestMatch.commence_time),
+      raw: bestMatch
+    };
+  } catch {
+    return null;
+  }
 }
 
-setInterval(runPickAnalysis, 60 * 60 * 1000);
+async function apiSportsGet(sportCode, endpoint, params, providerTrace) {
+  if (!APISPORTS_KEY) {
+    providerTrace.push(buildProviderTrace('api-sports', endpoint, false, 'APISPORTS_KEY no configurado'));
+    return null;
+  }
+  const baseUrl = APISPORTS_BASE_URLS[sportCode];
+  if (!baseUrl) {
+    providerTrace.push(buildProviderTrace('api-sports', endpoint, false, `Sport no soportado: ${sportCode}`));
+    return null;
+  }
+  const targetUrl = `${baseUrl}${endpoint}`;
+  try {
+    const response = await axios.get(targetUrl, {
+      params,
+      timeout: 12000,
+      headers: { 'x-apisports-key': APISPORTS_KEY }
+    });
+    providerTrace.push(buildProviderTrace('api-sports', `${endpoint}`, true, `HTTP ${response.status}`, { params }));
+    return response.data;
+  } catch (error) {
+    providerTrace.push(buildProviderTrace('api-sports', `${endpoint}`, false, error.message || 'Error provider', { params }));
+    return null;
+  }
+}
+
+function extractApiSportsRows(payload) {
+  if (Array.isArray(payload?.response)) return payload.response;
+  if (Array.isArray(payload)) return payload;
+  return [];
+}
+
+function extractEventIdFromApiSportsRow(row) {
+  return toSafeString(row?.fixture?.id || row?.game?.id || row?.id);
+}
+
+function extractEventTeamsFromApiSportsRow(row) {
+  const homeTeam = toSafeString(
+    row?.teams?.home?.name ||
+    row?.home?.name ||
+    row?.home_team ||
+    row?.homeTeam
+  );
+  const awayTeam = toSafeString(
+    row?.teams?.away?.name ||
+    row?.away?.name ||
+    row?.away_team ||
+    row?.awayTeam
+  );
+  return { homeTeam, awayTeam };
+}
+
+async function findApiSportsEventId({ sportCode, homeTeam, awayTeam, eventDate, providerTrace }) {
+  const endpoint = sportCode === 'football' ? '/fixtures' : '/games';
+  const dateCandidates = buildDateCandidates(eventDate);
+  let best = null;
+  let bestScore = -1;
+  for (const date of dateCandidates) {
+    const payload = await apiSportsGet(sportCode, endpoint, { date }, providerTrace);
+    const rows = extractApiSportsRows(payload);
+    for (const row of rows) {
+      const teams = extractEventTeamsFromApiSportsRow(row);
+      const score = scoreNameMatch(homeTeam, teams.homeTeam) + scoreNameMatch(awayTeam, teams.awayTeam);
+      if (score > bestScore) {
+        bestScore = score;
+        best = row;
+      }
+    }
+  }
+  if (!best || bestScore <= 1) return null;
+  const eventId = extractEventIdFromApiSportsRow(best);
+  if (!eventId) return null;
+  return { eventId, row: best, score: bestScore };
+}
+
+function flattenNumericPaths(node, prefix = '', acc = [], depth = 0) {
+  if (depth > 5 || node === null || node === undefined) return acc;
+  if (typeof node === 'number') {
+    acc.push({ path: prefix, value: node });
+    return acc;
+  }
+  if (typeof node === 'string') {
+    const parsed = Number(node);
+    if (Number.isFinite(parsed)) acc.push({ path: prefix, value: parsed });
+    return acc;
+  }
+  if (Array.isArray(node)) {
+    node.forEach((item, index) => flattenNumericPaths(item, `${prefix}[${index}]`, acc, depth + 1));
+    return acc;
+  }
+  if (typeof node === 'object') {
+    Object.entries(node).forEach(([key, value]) => {
+      const path = prefix ? `${prefix}.${key}` : key;
+      flattenNumericPaths(value, path, acc, depth + 1);
+    });
+  }
+  return acc;
+}
+
+function collectPlayerCandidates(node, acc = [], depth = 0) {
+  if (depth > 6 || node === null || node === undefined) return acc;
+  if (Array.isArray(node)) {
+    node.forEach((item) => collectPlayerCandidates(item, acc, depth + 1));
+    return acc;
+  }
+  if (typeof node !== 'object') return acc;
+
+  if (node.player && typeof node.player === 'object' && toSafeString(node.player.name)) {
+    acc.push({ name: toSafeString(node.player.name), raw: node });
+  } else if (toSafeString(node.player_name)) {
+    acc.push({ name: toSafeString(node.player_name), raw: node });
+  } else if (toSafeString(node.name) && (node.statistics || node.stats)) {
+    acc.push({ name: toSafeString(node.name), raw: node });
+  }
+
+  if (Array.isArray(node.players)) {
+    node.players.forEach((playerEntry) => {
+      if (playerEntry?.player?.name) {
+        acc.push({ name: toSafeString(playerEntry.player.name), raw: playerEntry });
+      }
+    });
+  }
+  Object.values(node).forEach((value) => collectPlayerCandidates(value, acc, depth + 1));
+  return acc;
+}
+
+function resolveStatValueFromCandidate(candidateRaw, statType) {
+  const normalizedStatType = normalizeStatType(statType);
+  const aliases = PROP_STAT_ALIASES[normalizedStatType] || [normalizedStatType];
+  if (Array.isArray(candidateRaw?.statistics)) {
+    for (const statEntry of candidateRaw.statistics) {
+      const statLabel = normalizeToken(statEntry?.type || statEntry?.name || '');
+      if (!statLabel) continue;
+      if (aliases.some((alias) => statLabel.includes(alias.replace(/_/g, ' ')))) {
+        const statValue = toSafeNumber(statEntry?.value);
+        if (statValue !== null) return statValue;
+      }
+    }
+  }
+  const flat = flattenNumericPaths(candidateRaw);
+  for (const alias of aliases) {
+    const found = flat.find((item) => normalizeToken(item.path).includes(alias.replace(/_/g, ' ')));
+    if (found) return found.value;
+  }
+  return null;
+}
+
+function pickBestPlayerCandidate(candidates, playerName) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  if (!playerName) return candidates[0];
+  const ranked = candidates
+    .map((candidate) => ({ candidate, score: scoreNameMatch(playerName, candidate.name) }))
+    .sort((a, b) => b.score - a.score);
+  return ranked[0]?.score > 0 ? ranked[0].candidate : null;
+}
+
+function extractPlayerIds(payload) {
+  const rows = extractApiSportsRows(payload);
+  return rows
+    .map((row) => row?.player?.id || row?.id)
+    .filter((item) => item !== undefined && item !== null)
+    .map((item) => String(item));
+}
+
+async function fetchApiSportsPropValue({ sportCode, eventId, playerName, statType, providerTrace }) {
+  let payload = null;
+  if (sportCode === 'football') {
+    payload = await apiSportsGet(sportCode, '/fixtures/players', { fixture: eventId }, providerTrace);
+  } else {
+    payload = await apiSportsGet(sportCode, '/games/statistics', { id: eventId }, providerTrace);
+    if (!payload) payload = await apiSportsGet(sportCode, '/games/statistics', { game: eventId }, providerTrace);
+  }
+  let candidates = collectPlayerCandidates(payload);
+  if ((!candidates || candidates.length === 0) && playerName) {
+    let playerSearch = await apiSportsGet(sportCode, '/players', { search: playerName }, providerTrace);
+    if (!playerSearch) playerSearch = await apiSportsGet(sportCode, '/players', { name: playerName }, providerTrace);
+    const playerIds = extractPlayerIds(playerSearch).slice(0, 3);
+    for (const playerId of playerIds) {
+      let statsPayload = await apiSportsGet(sportCode, '/players/statistics', { id: playerId, game: eventId }, providerTrace);
+      if (!statsPayload) statsPayload = await apiSportsGet(sportCode, '/players/statistics', { player: playerId, game: eventId }, providerTrace);
+      if (!statsPayload) statsPayload = await apiSportsGet(sportCode, '/players/statistics', { id: playerId, fixture: eventId }, providerTrace);
+      candidates = collectPlayerCandidates(statsPayload);
+      if (candidates.length > 0) break;
+    }
+  }
+  const bestCandidate = pickBestPlayerCandidate(candidates, playerName);
+  if (!bestCandidate) {
+    return { ok: false, message: 'No se encontró jugador en proveedor secundario.' };
+  }
+  const statValue = resolveStatValueFromCandidate(bestCandidate.raw, statType);
+  if (statValue === null) {
+    return { ok: false, message: `No se encontró stat ${statType} para ${bestCandidate.name}.` };
+  }
+  return { ok: true, statValue, playerName: bestCandidate.name };
+}
+
+async function resolvePropMarket(pick, bet) {
+  const providerTrace = [];
+  const sportCode = resolveSecondarySportCode({
+    sportKey: bet?.sportKey || pick?.sportKey,
+    sport: bet?.sport || pick?.sport,
+    league: pick?.league
+  });
+  if (!SUPPORTED_PROP_SPORTS.has(sportCode)) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 25,
+      detalle: 'Prop en deporte no soportado automáticamente.',
+      needsReview: true,
+      evidence: [],
+      providerTrace
+    };
+  }
+  const [matchHome, matchAway] = splitMatchTeams(pick?.match);
+  const homeTeam = toSafeString(bet?.homeTeam || matchHome);
+  const awayTeam = toSafeString(bet?.awayTeam || matchAway);
+  const eventLookup = await findApiSportsEventId({
+    sportCode,
+    homeTeam,
+    awayTeam,
+    eventDate: bet?.eventDate || pick?.time,
+    providerTrace
+  });
+  if (!eventLookup?.eventId) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 30,
+      detalle: 'No se localizó evento en proveedor secundario de props.',
+      needsReview: true,
+      evidence: [],
+      providerTrace
+    };
+  }
+  const side = normalizeSide(bet?.side || bet?.selection);
+  const line = toSafeNumber(bet?.line);
+  const playerName = toSafeString(bet?.playerName);
+  const statType = normalizeStatType(bet?.statType || bet?.marketKey || bet?.marketType);
+  if (!playerName || !statType || line === null || !['over', 'under'].includes(side)) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 32,
+      detalle: 'Prop incompleto: se requiere jugador, statType, línea y over/under.',
+      needsReview: true,
+      evidence: [],
+      providerTrace
+    };
+  }
+  const statResult = await fetchApiSportsPropValue({
+    sportCode,
+    eventId: eventLookup.eventId,
+    playerName,
+    statType,
+    providerTrace
+  });
+  if (!statResult.ok) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 35,
+      detalle: statResult.message || 'Sin estadística oficial para prop.',
+      needsReview: true,
+      evidence: [],
+      providerTrace
+    };
+  }
+  const statValue = statResult.statValue;
+  if (statValue === line) {
+    return {
+      resultado: 'VOID',
+      confianza: 84,
+      detalle: `${statResult.playerName} terminó con ${statValue}, exacto a la línea ${line}.`,
+      needsReview: false,
+      evidence: [{ provider: 'api-sports', type: 'player-prop', detail: `${statType}: ${statValue}`, value: { statType, statValue, line, side, player: statResult.playerName } }],
+      providerTrace
+    };
+  }
+  const won = (side === 'over' && statValue > line) || (side === 'under' && statValue < line);
+  return {
+    resultado: won ? 'GANADO' : 'PERDIDO',
+    confianza: 86,
+    detalle: won
+      ? `${statResult.playerName} ${side} ${line} (${statType}: ${statValue})`
+      : `${statResult.playerName} no cumplió ${side} ${line} (${statType}: ${statValue})`,
+    needsReview: false,
+    evidence: [{ provider: 'api-sports', type: 'player-prop', detail: `${statType}: ${statValue}`, value: { statType, statValue, line, side, player: statResult.playerName } }],
+    providerTrace
+  };
+}
+
+async function buildPreliminaryAnalysisForPick(pick, options = {}) {
+  const baseBet = buildBetFromPick(pick);
+  let mergedBet = mergeBetData(baseBet, pick?.bet || {});
+  let ocrMeta = { status: 'not_attempted', confidence: 0, warnings: [] };
+  const shouldRunOcr = Boolean(
+    toSafeString(pick?.ticketImg) &&
+    (options.forceOcr || !pick?.bet?.marketType || !pick?.bet?.selection || mergedBet.marketType === 'player_prop')
+  );
+  if (shouldRunOcr) {
+    const ocrResult = await extractTicketBetWithVision(pick, mergedBet);
+    ocrMeta = ocrResult.meta || ocrMeta;
+    if (ocrResult.bet) mergedBet = mergeBetData(mergedBet, ocrResult.bet);
+  }
+  const marketType = normalizeMarketType(mergedBet.marketType, mergedBet.betType);
+  mergedBet.marketType = marketType;
+  let resolution = null;
+  if (marketType === 'player_prop') {
+    resolution = await resolvePropMarket(pick, mergedBet);
+  } else {
+    const [matchHome, matchAway] = splitMatchTeams(pick?.match);
+    const score = await getMatchScore(
+      pick?.league,
+      mergedBet.homeTeam || matchHome || '',
+      mergedBet.awayTeam || matchAway || '',
+      mergedBet.sportKey || pick?.sportKey,
+      mergedBet.eventId
+    );
+    resolution = resolveStandardMarket(mergedBet, score);
+  }
+  const aiAnalysis = {
+    resultado: resolution.resultado || 'NECESITA_VERIFICACION',
+    confianza: clampNumber(resolution.confianza, 0, 100, 0),
+    detalle: toSafeString(resolution.detalle || 'Sin detalle'),
+    source: marketType === 'player_prop' ? 'deterministic+api-sports' : 'deterministic+odds',
+    adminClosureRequired: true,
+    needsReview: Boolean(resolution.needsReview),
+    evidence: Array.isArray(resolution.evidence) ? resolution.evidence.slice(0, 8) : []
+  };
+  const verificationStatus = aiAnalysis.resultado === 'PENDIENTE'
+    ? 'pending_data'
+    : aiAnalysis.needsReview
+      ? 'needs_review'
+      : 'preliminary_ready';
+  const verification = {
+    ...(pick?.verification || {}),
+    status: verificationStatus,
+    preliminaryResult: aiAnalysis.resultado,
+    confidence: aiAnalysis.confianza,
+    needsReview: aiAnalysis.needsReview,
+    summary: aiAnalysis.detalle,
+    engineVersion: AI_ENGINE_VERSION,
+    lastAnalyzedAt: new Date(),
+    ocr: {
+      status: ocrMeta.status || pick?.verification?.ocr?.status || 'not_attempted',
+      confidence: clampNumber(ocrMeta.confidence ?? pick?.verification?.ocr?.confidence ?? 0, 0, 100, 0),
+      parsedAt: ocrMeta.status === 'parsed' ? new Date() : (pick?.verification?.ocr?.parsedAt || null),
+      warnings: Array.isArray(ocrMeta.warnings) ? ocrMeta.warnings.slice(0, 8) : [],
+      raw: ocrMeta.raw || null
+    },
+    evidence: aiAnalysis.evidence,
+    providerTrace: Array.isArray(resolution.providerTrace) ? resolution.providerTrace.slice(0, 15) : []
+  };
+  return { bet: mergedBet, aiAnalysis, verification };
+}
+
+async function analyzeAndPersistPick(pick, options = {}) {
+  const computed = await buildPreliminaryAnalysisForPick(pick, options);
+  const updated = await Pick.findByIdAndUpdate(
+    pick._id,
+    { $set: { bet: computed.bet, aiAnalysis: computed.aiAnalysis, verification: computed.verification } },
+    { new: true }
+  );
+  return updated;
+}
+
+async function runPickAnalysis(options = {}) {
+  const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+  const query = options.pickId
+    ? { _id: options.pickId }
+    : { result: 'pending', createdAt: options.includeRecent ? { $exists: true } : { $lt: sixHoursAgo } };
+  const picks = await Pick.find(query);
+  const summary = { total: picks.length, analyzed: 0, failed: 0, pending: 0, results: [] };
+  for (const pick of picks) {
+    try {
+      const updated = await analyzeAndPersistPick(pick, { forceOcr: Boolean(options.forceOcr) });
+      summary.analyzed += 1;
+      if (updated?.aiAnalysis?.resultado === 'PENDIENTE') summary.pending += 1;
+      summary.results.push({
+        pickId: String(pick._id),
+        resultado: updated?.aiAnalysis?.resultado || 'NECESITA_VERIFICACION',
+        confianza: updated?.aiAnalysis?.confianza || 0
+      });
+    } catch (error) {
+      summary.failed += 1;
+      summary.results.push({ pickId: String(pick._id), error: error.message || 'analysis_failed' });
+    }
+  }
+  return summary;
+}
+
+setInterval(() => {
+  runPickAnalysis({ includeRecent: false, forceOcr: false })
+    .catch((error) => console.error('runPickAnalysis error:', error.message || error));
+}, 60 * 60 * 1000);
 
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
-  runPickAnalysis();
-  res.json({ success: true, message: 'Analisis iniciado' });
+  try {
+    const summary = await runPickAnalysis({ includeRecent: true, forceOcr: true });
+    res.json({ success: true, ...summary });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
   try {
     const pick = await Pick.findById(req.params.id);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
-    const parts = pick.match.split(' vs ');
-    if (parts.length < 2) return res.status(400).json({ error: 'Invalid match format' });
-    const score = await getMatchScore(pick.league, parts[0].trim(), parts[1].trim(), pick.sportKey);
-    if (!score) return res.status(404).json({ error: 'Score not found' });
-    const analysis = await analyzeWithClaude(pick, score);
-    if (analysis) { await Pick.findByIdAndUpdate(pick._id, { aiAnalysis: analysis }); res.json({ success: true, analysis }); }
-    else res.status(500).json({ error: 'Analysis failed' });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
+    res.json({
+      success: true,
+      analysis: updated?.aiAnalysis || null,
+      verification: updated?.verification || null,
+      bet: updated?.bet || null
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ── SERVER ────────────────────────────────────────────────────────────────────
