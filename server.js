@@ -11,7 +11,24 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const resolveStripeSecretKey = () => {
+  const direct = (process.env.STRIPE_SECRET_KEY || '').trim();
+  if (direct) return direct;
+  const mode = (process.env.STRIPE_MODE || '').trim().toLowerCase();
+  const liveKey = (process.env.STRIPE_LIVE_SECRET_KEY || process.env.STRIPE_SECRET_KEY_LIVE || '').trim();
+  const testKey = (process.env.STRIPE_TEST_SECRET_KEY || process.env.STRIPE_SECRET_KEY_TEST || '').trim();
+  if (mode === 'live') return liveKey || testKey;
+  if (mode === 'test') return testKey || liveKey;
+  if ((process.env.NODE_ENV || '').trim() === 'production') return liveKey || testKey;
+  return testKey || liveKey;
+};
+const STRIPE_SECRET_KEY = resolveStripeSecretKey();
+if (!STRIPE_SECRET_KEY) {
+  throw new Error('Stripe no configurado: define STRIPE_SECRET_KEY o STRIPE_LIVE_SECRET_KEY/STRIPE_TEST_SECRET_KEY');
+}
+const STRIPE_MODE = STRIPE_SECRET_KEY.startsWith('sk_live_') ? 'live' : 'test';
+console.log(`[Stripe] initialized in ${STRIPE_MODE} mode`);
+const stripe = new Stripe(STRIPE_SECRET_KEY);
 const PRO_PLAN_AMOUNT_USD = 29.99;
 const PRO_PLAN_AMOUNT_CENTS = Math.round(PRO_PLAN_AMOUNT_USD * 100);
 const PRO_PLAN_DURATION_DAYS = 30;
@@ -31,6 +48,10 @@ const UserSchema = new mongoose.Schema({
   roi:        { type: String, default: '+0%' },
   winRate:    { type: Number, default: 0 },
   totalPicks: { type: Number, default: 0 },
+  wonPicks:   { type: Number, default: 0 },
+  lostPicks:  { type: Number, default: 0 },
+  pushPicks:  { type: Number, default: 0 },
+  avgOdds:    { type: Number, default: 0 },
   balance:    { type: Number, default: 0 },
   proExpiry:  { type: Date },
   createdAt:  { type: Date, default: Date.now }
@@ -52,6 +73,7 @@ const PickSchema = new mongoose.Schema({
   ticketImg:  { type: String },
   result:     { type: String, default: 'pending', enum: ['pending','won','lost','void'] },
   buyers:     [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  downloadCount: { type: Number, default: 0 },
   aiAnalysis: { type: Object },
   createdAt:  { type: Date, default: Date.now }
 });
@@ -67,6 +89,80 @@ const PurchaseSchema = new mongoose.Schema({
 });
 PurchaseSchema.index({ pickId: 1, buyerId: 1 }, { unique: true });
 const Purchase = mongoose.model('Purchase', PurchaseSchema);
+
+const parsePositiveNumber = (value, fallback = 0) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+};
+
+const formatRoiPercent = (value) => {
+  const numeric = Number.isFinite(value) ? value : 0;
+  const fixed = numeric.toFixed(1);
+  return numeric >= 0 ? `+${fixed}%` : `${fixed}%`;
+};
+
+const calculateTipsterStatsFromPicks = (resolvedPicks) => {
+  const picks = Array.isArray(resolvedPicks) ? resolvedPicks : [];
+  let wonPicks = 0;
+  let lostPicks = 0;
+  let pushPicks = 0;
+  let totalRiskedUnits = 0;
+  let totalProfitUnits = 0;
+  let oddsAccumulator = 0;
+  let oddsCount = 0;
+
+  for (const pick of picks) {
+    const stakeUnits = parsePositiveNumber(pick?.bank, 10);
+    const oddsValue = parsePositiveNumber(pick?.odds, 0);
+    if (oddsValue > 0) {
+      oddsAccumulator += oddsValue;
+      oddsCount += 1;
+    }
+
+    if (pick?.result === 'won') {
+      wonPicks += 1;
+      totalRiskedUnits += stakeUnits;
+      totalProfitUnits += stakeUnits * (Math.max(oddsValue, 1) - 1);
+      continue;
+    }
+    if (pick?.result === 'lost') {
+      lostPicks += 1;
+      totalRiskedUnits += stakeUnits;
+      totalProfitUnits -= stakeUnits;
+      continue;
+    }
+    if (pick?.result === 'void') {
+      pushPicks += 1;
+    }
+  }
+
+  const decisivePicks = wonPicks + lostPicks;
+  const winRate = decisivePicks > 0 ? Math.round((wonPicks / decisivePicks) * 100) : 0;
+  const roiValue = totalRiskedUnits > 0 ? ((totalProfitUnits / totalRiskedUnits) * 100) : 0;
+  const avgOdds = oddsCount > 0 ? Number((oddsAccumulator / oddsCount).toFixed(2)) : 0;
+
+  return {
+    roi: formatRoiPercent(Number(roiValue.toFixed(1))),
+    winRate,
+    totalPicks: wonPicks + lostPicks + pushPicks,
+    wonPicks,
+    lostPicks,
+    pushPicks,
+    avgOdds
+  };
+};
+
+const recalculateTipsterStats = async (tipsterId) => {
+  if (!tipsterId) return null;
+  const resolvedPicks = await Pick.find({
+    tipsterId,
+    result: { $in: ['won', 'lost', 'void'] }
+  }).select('result bank odds');
+  const stats = calculateTipsterStatsFromPicks(resolvedPicks);
+  await User.findByIdAndUpdate(tipsterId, stats);
+  return stats;
+};
 
 // ── MIDDLEWARE ────────────────────────────────────────────────────────────────
 const auth = async (req, res, next) => {
@@ -135,7 +231,25 @@ app.post('/api/auth/login', async (req, res) => {
       user.role = 'basic';
     }
     const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET || 'thepickzone_secret_2026', { expiresIn: '7d' });
-    res.json({ token, user: { _id: user._id, name: user.name, email: user.email, role: user.role, avatar: user.avatar, bio: user.bio, roi: user.roi, winRate: user.winRate, totalPicks: user.totalPicks, proExpiry: user.proExpiry } });
+    res.json({
+      token,
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        avatar: user.avatar,
+        bio: user.bio,
+        roi: user.roi,
+        winRate: user.winRate,
+        totalPicks: user.totalPicks,
+        wonPicks: user.wonPicks,
+        lostPicks: user.lostPicks,
+        pushPicks: user.pushPicks,
+        avgOdds: user.avgOdds,
+        proExpiry: user.proExpiry
+      }
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -172,25 +286,36 @@ app.post('/api/picks', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+app.post('/api/picks/:id/download', auth, async (req, res) => {
+  try {
+    const pick = await Pick.findById(req.params.id);
+    if (!pick) return res.status(404).json({ error: 'Pick not found' });
+    const accessState = await getPickAccessState(pick, req.user.id, req.user.role);
+    if (!accessState.hasAccess) return res.status(403).json({ error: 'No tienes acceso' });
+    if (!pick.ticketImg) return res.status(404).json({ error: 'Ticket no disponible' });
+
+    const updatedPick = await Pick.findByIdAndUpdate(
+      req.params.id,
+      { $inc: { downloadCount: 1 } },
+      { new: true, projection: { ticketImg: 1, downloadCount: 1 } }
+    );
+
+    res.json({ success: true, ticketImg: updatedPick?.ticketImg || pick.ticketImg, downloadCount: updatedPick?.downloadCount || 0 });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.put('/api/picks/:id/result', auth, requireAdmin, async (req, res) => {
   try {
     const { result } = req.body;
     if (!['won','lost','void','pending'].includes(result)) return res.status(400).json({ error: 'Invalid result' });
     const pick = await Pick.findById(req.params.id);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
-    await Pick.findByIdAndUpdate(req.params.id, { result });
-    if (result !== 'void' && result !== 'pending' && pick.tipsterId) {
-      const allPicks = await Pick.find({ tipsterId: pick.tipsterId, result: { $in: ['won','lost'] } });
-      const won = allPicks.filter(p => p.result === 'won').length;
-      const total = allPicks.length;
-      const winRate = total > 0 ? Math.round((won / total) * 100) : 0;
-      const totalInvested = allPicks.reduce((s,p) => s + (parseFloat(p.bank)||10), 0);
-      const totalReturn = allPicks.filter(p=>p.result==='won').reduce((s,p) => s + (parseFloat(p.bank)||10) * (parseFloat(p.odds)||1), 0);
-      const roiVal = totalInvested > 0 ? ((totalReturn - totalInvested) / totalInvested * 100).toFixed(1) : '0';
-      const roiStr = parseFloat(roiVal) >= 0 ? '+'+roiVal+'%' : roiVal+'%';
-      await User.findByIdAndUpdate(pick.tipsterId, { roi: roiStr, winRate, totalPicks: total });
+    const updatedPick = await Pick.findByIdAndUpdate(req.params.id, { result }, { new: true });
+    let tipsterStats = null;
+    if (pick.tipsterId) {
+      tipsterStats = await recalculateTipsterStats(pick.tipsterId);
     }
-    res.json({ success: true, result });
+    res.json({ success: true, result: updatedPick?.result || result, tipsterStats });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -303,7 +428,7 @@ app.get('/api/admin/picks-all', auth, requireAdmin, async (req, res) => {
 
 app.post('/api/admin/reset-stats', auth, requireAdmin, async (req, res) => {
   try {
-    await User.updateMany({}, { roi: '+0%', winRate: 0, totalPicks: 0, balance: 0 });
+    await User.updateMany({}, { roi: '+0%', winRate: 0, totalPicks: 0, wonPicks: 0, lostPicks: 0, pushPicks: 0, avgOdds: 0, balance: 0 });
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -326,7 +451,7 @@ app.post('/api/admin/clean-db', async (req, res) => {
     const keepEmails = ['admin@thepickzone.com','75_solos_cierne@icloud.com','fernando.martinez10@hotmail.com'];
     const deleted = await User.deleteMany({ email: { $nin: keepEmails } });
     const picksDeleted = await Pick.deleteMany({});
-    await User.updateMany({}, { roi: '+0%', winRate: 0, totalPicks: 0, balance: 0 });
+    await User.updateMany({}, { roi: '+0%', winRate: 0, totalPicks: 0, wonPicks: 0, lostPicks: 0, pushPicks: 0, avgOdds: 0, balance: 0 });
     res.json({ success: true, usersDeleted: deleted.deletedCount, picksDeleted: picksDeleted.deletedCount });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -466,6 +591,23 @@ const hasPickBuyerAccess = async (pickId, userId) => {
   if (!pickId || !userId) return false;
   const existingPurchase = await Purchase.exists({ pickId, buyerId: userId });
   return Boolean(existingPurchase);
+};
+
+const getPickAccessState = async (pick, userId, userRole) => {
+  if (!pick || !userId) {
+    return { hasAccess: false, isOwner: false, isPurchased: false, isFree: false, isAdmin: false };
+  }
+  const isOwner = String(pick.tipsterId) === String(userId);
+  const isPurchased = await hasPickBuyerAccess(pick._id, userId);
+  const isFree = normalizeUsdCents(pick.price) === 0;
+  const isAdmin = userRole === 'admin';
+  return {
+    hasAccess: Boolean(isOwner || isPurchased || isFree || isAdmin),
+    isOwner,
+    isPurchased,
+    isFree,
+    isAdmin
+  };
 };
 
 app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => {
@@ -684,11 +826,8 @@ app.get('/api/picks/:id/full', auth, async (req, res) => {
   try {
     const pick = await Pick.findById(req.params.id);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
-    const isOwner = String(pick.tipsterId) === String(req.user.id);
-    const isPurchased = await hasPickBuyerAccess(pick._id, req.user.id);
-    const isFree = normalizeUsdCents(pick.price) === 0;
-    const isAdmin = req.user.role === 'admin';
-    if (!isOwner && !isPurchased && !isFree && !isAdmin) return res.status(403).json({ error: 'No tienes acceso' });
+    const accessState = await getPickAccessState(pick, req.user.id, req.user.role);
+    if (!accessState.hasAccess) return res.status(403).json({ error: 'No tienes acceso' });
     res.json(pick);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
