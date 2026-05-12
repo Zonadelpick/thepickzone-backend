@@ -1979,14 +1979,58 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
   };
   return { bet: mergedBet, aiAnalysis, verification };
 }
+const AUTO_CLOSE_CONFIDENCE_THRESHOLD = Number.isFinite(Number(process.env.AUTO_CLOSE_CONFIDENCE_THRESHOLD))
+  ? Math.max(0, Math.min(100, Number(process.env.AUTO_CLOSE_CONFIDENCE_THRESHOLD)))
+  : 80;
+
+function mapAiOutcomeToPickResult(outcome) {
+  const normalized = toSafeString(outcome).toUpperCase();
+  if (['GANADO', 'WON'].includes(normalized)) return 'won';
+  if (['PERDIDO', 'LOST'].includes(normalized)) return 'lost';
+  if (['VOID', 'PUSH'].includes(normalized)) return 'void';
+  return null;
+}
 
 async function analyzeAndPersistPick(pick, options = {}) {
   const computed = await buildPreliminaryAnalysisForPick(pick, options);
+  const aiOutcome = mapAiOutcomeToPickResult(computed?.aiAnalysis?.resultado);
+  const aiConfidence = Number(computed?.aiAnalysis?.confianza ?? 0);
+  const canAutoClose = String(pick?.result || 'pending').toLowerCase() === 'pending';
+  const shouldAutoClose = Boolean(
+    canAutoClose &&
+    aiOutcome &&
+    !computed?.aiAnalysis?.needsReview &&
+    Number.isFinite(aiConfidence) &&
+    aiConfidence >= AUTO_CLOSE_CONFIDENCE_THRESHOLD
+  );
+
+  if (shouldAutoClose) {
+    computed.verification = {
+      ...computed.verification,
+      status: 'closed_auto',
+      needsReview: false,
+      summary: `Cierre automático IA: ${computed?.aiAnalysis?.resultado || 'SIN RESULTADO'}`,
+      closedBy: null,
+      lastClosedAt: new Date()
+    };
+  }
+
+  const updatePayload = {
+    bet: computed.bet,
+    aiAnalysis: computed.aiAnalysis,
+    verification: computed.verification
+  };
+  if (shouldAutoClose) {
+    updatePayload.result = aiOutcome;
+  }
   const updated = await Pick.findByIdAndUpdate(
     pick._id,
-    { $set: { bet: computed.bet, aiAnalysis: computed.aiAnalysis, verification: computed.verification } },
+    { $set: updatePayload },
     { new: true }
   );
+  if (shouldAutoClose && pick?.tipsterId) {
+    await recalculateTipsterStats(pick.tipsterId);
+  }
   return updated;
 }
 
@@ -1996,16 +2040,18 @@ async function runPickAnalysis(options = {}) {
     ? { _id: options.pickId }
     : { result: 'pending', createdAt: options.includeRecent ? { $exists: true } : { $lt: sixHoursAgo } };
   const picks = await Pick.find(query);
-  const summary = { total: picks.length, analyzed: 0, failed: 0, pending: 0, results: [] };
+  const summary = { total: picks.length, analyzed: 0, failed: 0, pending: 0, autoClosed: 0, results: [] };
   for (const pick of picks) {
     try {
       const updated = await analyzeAndPersistPick(pick, { forceOcr: Boolean(options.forceOcr) });
       summary.analyzed += 1;
       if (updated?.aiAnalysis?.resultado === 'PENDIENTE') summary.pending += 1;
+      if (String(updated?.result || 'pending').toLowerCase() !== 'pending') summary.autoClosed += 1;
       summary.results.push({
         pickId: String(pick._id),
         resultado: updated?.aiAnalysis?.resultado || 'NECESITA_VERIFICACION',
-        confianza: updated?.aiAnalysis?.confianza || 0
+        confianza: updated?.aiAnalysis?.confianza || 0,
+        result: updated?.result || 'pending'
       });
     } catch (error) {
       summary.failed += 1;
@@ -2014,11 +2060,19 @@ async function runPickAnalysis(options = {}) {
   }
   return summary;
 }
+const PICK_ANALYSIS_INTERVAL_MS = Number.isFinite(Number(process.env.PICK_ANALYSIS_INTERVAL_MS))
+  ? Math.max(60_000, Number(process.env.PICK_ANALYSIS_INTERVAL_MS))
+  : 15 * 60 * 1000;
+
+setTimeout(() => {
+  runPickAnalysis({ includeRecent: false, forceOcr: false })
+    .catch((error) => console.error('initial runPickAnalysis error:', error.message || error));
+}, 15_000);
 
 setInterval(() => {
   runPickAnalysis({ includeRecent: false, forceOcr: false })
     .catch((error) => console.error('runPickAnalysis error:', error.message || error));
-}, 60 * 60 * 1000);
+}, PICK_ANALYSIS_INTERVAL_MS);
 
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   try {
