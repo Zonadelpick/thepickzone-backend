@@ -5,6 +5,10 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const axios = require('axios');
 const Stripe = require('stripe');
+const {
+  resolveAutoCloseThresholdConfig,
+  shouldAutoClosePick
+} = require('./autoCloseRules');
 require('dotenv').config();
 
 const app = express();
@@ -235,15 +239,307 @@ const calculateTipsterStatsFromPicks = (resolvedPicks) => {
 };
 
 const recalculateTipsterStats = async (tipsterId) => {
-  if (!tipsterId) return null;
+  const normalizedTipsterId = String(tipsterId || '').trim();
+  if (!normalizedTipsterId || !mongoose.Types.ObjectId.isValid(normalizedTipsterId)) return null;
   const resolvedPicks = await Pick.find({
-    tipsterId,
+    tipsterId: normalizedTipsterId,
     result: { $in: ['won', 'lost', 'void'] }
   }).select('result bank odds');
   const stats = calculateTipsterStatsFromPicks(resolvedPicks);
-  await User.findByIdAndUpdate(tipsterId, stats);
+  await User.findByIdAndUpdate(normalizedTipsterId, stats);
   return stats;
 };
+const safeRecalculateTipsterStats = async (tipsterId, sourceLabel = 'unknown') => {
+  try {
+    return await recalculateTipsterStats(tipsterId);
+  } catch (error) {
+    console.error(`[tipster-stats] ${sourceLabel}:`, error.message || error);
+    return null;
+  }
+};
+const AUTO_CLOSE_THRESHOLD_CONFIG = resolveAutoCloseThresholdConfig(process.env);
+
+const DEFAULT_PENDING_STALE_HOURS = Number.isFinite(Number(process.env.PICK_PENDING_STALE_HOURS))
+  ? Math.max(1, Math.min(720, Number(process.env.PICK_PENDING_STALE_HOURS)))
+  : 12;
+const DEFAULT_REVIEW_STALE_HOURS = Number.isFinite(Number(process.env.PICK_REVIEW_STALE_HOURS))
+  ? Math.max(1, Math.min(720, Number(process.env.PICK_REVIEW_STALE_HOURS)))
+  : 6;
+const DEFAULT_ALERT_LOOKBACK_HOURS = Number.isFinite(Number(process.env.PICK_ALERT_LOOKBACK_HOURS))
+  ? Math.max(1, Math.min(720, Number(process.env.PICK_ALERT_LOOKBACK_HOURS)))
+  : 24;
+
+function parseHoursSetting(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(720, parsed));
+}
+
+function parseListLimit(value, fallback = 120, max = 500) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(max, Math.floor(parsed)));
+}
+
+function dateHoursAgo(hours) {
+  return new Date(Date.now() - (Number(hours) * 60 * 60 * 1000));
+}
+
+function toDateOrNull(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed;
+}
+
+function computeAgeHours(dateLike) {
+  const parsed = toDateOrNull(dateLike);
+  if (!parsed) return 0;
+  const delta = Date.now() - parsed.getTime();
+  return Number((Math.max(0, delta) / (1000 * 60 * 60)).toFixed(1));
+}
+
+function resolveVerificationTimestamp(pick) {
+  return pick?.verification?.lastAnalyzedAt || pick?.createdAt || null;
+}
+
+function buildManualVerificationPatch(pickDoc, result, adminUserId) {
+  const currentVerification = pickDoc?.verification && typeof pickDoc.verification === 'object' ? pickDoc.verification : {};
+  if (result === 'pending') {
+    return {
+      ...currentVerification,
+      status: pickDoc?.aiAnalysis?.needsReview ? 'needs_review' : 'preliminary_ready',
+      preliminaryResult: pickDoc?.aiAnalysis?.resultado || currentVerification.preliminaryResult || 'PENDIENTE',
+      confidence: pickDoc?.aiAnalysis?.confianza ?? currentVerification.confidence ?? 0,
+      summary: pickDoc?.aiAnalysis?.detalle || currentVerification.summary || 'Pick reabierto por inconformidad',
+      needsReview: Boolean(pickDoc?.aiAnalysis?.needsReview),
+      closedBy: null,
+      lastClosedAt: null
+    };
+  }
+  return {
+    ...currentVerification,
+    status: 'closed_by_admin',
+    needsReview: false,
+    summary: `Cierre final admin: ${String(result).toUpperCase()}`,
+    closedBy: adminUserId || null,
+    lastClosedAt: new Date()
+  };
+}
+
+async function setOfficialResultForPick(pickId, result, adminUserId) {
+  const pick = await Pick.findById(pickId);
+  if (!pick) return null;
+  const verificationPatch = buildManualVerificationPatch(pick, result, adminUserId);
+  const updatedPick = await Pick.findByIdAndUpdate(
+    pickId,
+    { result, verification: verificationPatch },
+    { new: true }
+  );
+  let tipsterStats = null;
+  if (pick.tipsterId) {
+    tipsterStats = await safeRecalculateTipsterStats(pick.tipsterId, `setOfficialResultForPick:${pickId}`);
+  }
+  return { pick, updatedPick, tipsterStats };
+}
+
+function buildNeedsReviewStaleQuery(reviewCutoff) {
+  return {
+    result: 'pending',
+    'verification.status': 'needs_review',
+    $or: [
+      { 'verification.lastAnalyzedAt': { $lt: reviewCutoff } },
+      { 'verification.lastAnalyzedAt': { $exists: false }, createdAt: { $lt: reviewCutoff } }
+    ]
+  };
+}
+
+function buildPreliminaryReadyStaleQuery(pendingCutoff) {
+  return {
+    result: 'pending',
+    'verification.status': 'preliminary_ready',
+    $or: [
+      { 'verification.lastAnalyzedAt': { $lt: pendingCutoff } },
+      { 'verification.lastAnalyzedAt': { $exists: false }, createdAt: { $lt: pendingCutoff } }
+    ]
+  };
+}
+
+function resolveStaleReason(pick, pendingCutoff, reviewCutoff) {
+  const status = String(pick?.verification?.status || '').toLowerCase();
+  const verificationAt = resolveVerificationTimestamp(pick);
+  const verificationTime = toDateOrNull(verificationAt);
+  const createdAt = toDateOrNull(pick?.createdAt);
+  if (
+    status === 'needs_review' &&
+    ((verificationTime && verificationTime < reviewCutoff) || (!verificationTime && createdAt && createdAt < reviewCutoff))
+  ) {
+    return 'needs_review_stale';
+  }
+  if (
+    status === 'preliminary_ready' &&
+    ((verificationTime && verificationTime < pendingCutoff) || (!verificationTime && createdAt && createdAt < pendingCutoff))
+  ) {
+    return 'preliminary_ready_stale';
+  }
+  return 'pending_stale';
+}
+
+async function buildVerificationMonitorSnapshot(options = {}) {
+  const pendingStaleHours = parseHoursSetting(options.pendingStaleHours, DEFAULT_PENDING_STALE_HOURS);
+  const reviewStaleHours = parseHoursSetting(options.reviewStaleHours, DEFAULT_REVIEW_STALE_HOURS);
+  const lookbackHours = parseHoursSetting(options.lookbackHours, DEFAULT_ALERT_LOOKBACK_HOURS);
+  const limit = parseListLimit(options.limit, 120, 500);
+  const pendingCutoff = dateHoursAgo(pendingStaleHours);
+  const reviewCutoff = dateHoursAgo(reviewStaleHours);
+  const autoClosedCutoff = dateHoursAgo(lookbackHours);
+
+  const staleQuery = {
+    result: 'pending',
+    $or: [
+      { createdAt: { $lt: pendingCutoff } },
+      buildNeedsReviewStaleQuery(reviewCutoff),
+      buildPreliminaryReadyStaleQuery(pendingCutoff)
+    ]
+  };
+
+  const [staleDocs, pendingTotal, pendingStale, needsReviewTotal, needsReviewStale, preliminaryReadyTotal, preliminaryReadyStale, autoClosedRecent, statusCounts] = await Promise.all([
+    Pick.find(staleQuery)
+      .sort({ createdAt: 1 })
+      .limit(limit)
+      .select('_id match tipster league sport result createdAt verification.status verification.lastAnalyzedAt verification.confidence'),
+    Pick.countDocuments({ result: 'pending' }),
+    Pick.countDocuments({ result: 'pending', createdAt: { $lt: pendingCutoff } }),
+    Pick.countDocuments({ result: 'pending', 'verification.status': 'needs_review' }),
+    Pick.countDocuments(buildNeedsReviewStaleQuery(reviewCutoff)),
+    Pick.countDocuments({ result: 'pending', 'verification.status': 'preliminary_ready' }),
+    Pick.countDocuments(buildPreliminaryReadyStaleQuery(pendingCutoff)),
+    Pick.countDocuments({ 'verification.status': 'closed_auto', 'verification.lastClosedAt': { $gte: autoClosedCutoff } }),
+    Pick.aggregate([
+      { $match: { result: 'pending' } },
+      { $group: { _id: '$verification.status', count: { $sum: 1 } } },
+      { $sort: { count: -1 } }
+    ])
+  ]);
+
+  const stalePicks = staleDocs.map((pick) => ({
+    pickId: String(pick._id),
+    match: toSafeString(pick.match),
+    tipster: toSafeString(pick.tipster),
+    league: toSafeString(pick.league),
+    sport: toSafeString(pick.sport),
+    result: toSafeString(pick.result) || 'pending',
+    status: toSafeString(pick?.verification?.status) || 'pending',
+    confidence: Number(pick?.verification?.confidence ?? 0),
+    createdAt: pick?.createdAt || null,
+    lastAnalyzedAt: pick?.verification?.lastAnalyzedAt || null,
+    ageHours: computeAgeHours(resolveVerificationTimestamp(pick) || pick?.createdAt),
+    staleReason: resolveStaleReason(pick, pendingCutoff, reviewCutoff)
+  }));
+
+  return {
+    generatedAt: new Date(),
+    thresholds: {
+      pendingStaleHours,
+      reviewStaleHours,
+      lookbackHours
+    },
+    totals: {
+      pendingTotal,
+      pendingStale,
+      needsReviewTotal,
+      needsReviewStale,
+      preliminaryReadyTotal,
+      preliminaryReadyStale,
+      autoClosedRecent
+    },
+    statusCounts: statusCounts.map((entry) => ({
+      status: toSafeString(entry?._id) || 'pending',
+      count: Number(entry?.count || 0)
+    })),
+    stalePicks
+  };
+}
+
+async function buildVerificationAlerts(options = {}) {
+  const monitor = options.monitor || await buildVerificationMonitorSnapshot(options);
+  const lookbackHours = monitor?.thresholds?.lookbackHours || DEFAULT_ALERT_LOOKBACK_HOURS;
+  const autoClosedCutoff = dateHoursAgo(lookbackHours);
+  const recentAutoClosed = await Pick.find({
+    'verification.status': 'closed_auto',
+    'verification.lastClosedAt': { $gte: autoClosedCutoff }
+  })
+    .sort({ 'verification.lastClosedAt': -1 })
+    .limit(parseListLimit(options.autoClosedLimit, 8, 25))
+    .select('_id match tipster league result verification.lastClosedAt verification.confidence');
+
+  const alerts = [];
+  if (monitor?.totals?.pendingStale > 0) {
+    alerts.push({
+      id: 'pending-stale',
+      severity: 'high',
+      title: 'Picks pendientes atascados',
+      message: `${monitor.totals.pendingStale} picks llevan más de ${monitor.thresholds.pendingStaleHours}h en pending.`,
+      metric: monitor.totals.pendingStale,
+      at: new Date().toISOString()
+    });
+  }
+  if (monitor?.totals?.needsReviewStale > 0) {
+    alerts.push({
+      id: 'needs-review-stale',
+      severity: 'medium',
+      title: 'Revisión admin retrasada',
+      message: `${monitor.totals.needsReviewStale} picks en needs_review superan ${monitor.thresholds.reviewStaleHours}h.`,
+      metric: monitor.totals.needsReviewStale,
+      at: new Date().toISOString()
+    });
+  }
+  if (monitor?.totals?.preliminaryReadyStale > 0) {
+    alerts.push({
+      id: 'preliminary-ready-stale',
+      severity: 'medium',
+      title: 'Dictámenes listos sin cierre',
+      message: `${monitor.totals.preliminaryReadyStale} picks con preliminary_ready siguen sin cierre oficial.`,
+      metric: monitor.totals.preliminaryReadyStale,
+      at: new Date().toISOString()
+    });
+  }
+  if (monitor?.totals?.autoClosedRecent > 0) {
+    alerts.push({
+      id: 'auto-closed-recent',
+      severity: 'info',
+      title: 'Cierres automáticos recientes',
+      message: `${monitor.totals.autoClosedRecent} picks se cerraron automáticamente en las últimas ${monitor.thresholds.lookbackHours}h.`,
+      metric: monitor.totals.autoClosedRecent,
+      at: new Date().toISOString()
+    });
+  }
+
+  const autoClosedEvents = recentAutoClosed.map((pick, index) => ({
+    id: `auto-closed-event-${index}-${pick._id}`,
+    severity: 'info',
+    title: 'Pick cerrado automáticamente',
+    message: `${toSafeString(pick.match)} · ${toSafeString(pick.tipster)} (${String(pick.result || 'pending').toUpperCase()})`,
+    metric: Number(pick?.verification?.confidence ?? 0),
+    at: pick?.verification?.lastClosedAt || new Date().toISOString(),
+    pickId: String(pick._id)
+  }));
+
+  const staleEvents = (monitor?.stalePicks || []).slice(0, 8).map((pick, index) => ({
+    id: `stale-pick-${index}-${pick.pickId}`,
+    severity: pick.staleReason === 'needs_review_stale' ? 'high' : 'medium',
+    title: 'Pick requiere atención',
+    message: `${pick.match} · ${pick.tipster} · ${pick.staleReason.replace(/_/g, ' ')}`,
+    metric: pick.ageHours,
+    at: new Date().toISOString(),
+    pickId: pick.pickId
+  }));
+
+  return {
+    generatedAt: new Date(),
+    totals: monitor?.totals || {},
+    alerts: [...alerts, ...autoClosedEvents, ...staleEvents].slice(0, 30)
+  };
+}
 
 // ── MIDDLEWARE ────────────────────────────────────────────────────────────────
 const auth = async (req, res, next) => {
@@ -756,37 +1052,14 @@ app.put('/api/picks/:id/result', auth, requireAdmin, async (req, res) => {
   try {
     const { result } = req.body;
     if (!['won','lost','void','pending'].includes(result)) return res.status(400).json({ error: 'Invalid result' });
-    const pick = await Pick.findById(req.params.id);
-    if (!pick) return res.status(404).json({ error: 'Pick not found' });
-    const currentVerification = pick?.verification && typeof pick.verification === 'object' ? pick.verification : {};
-    const verificationPatch = result === 'pending'
-      ? {
-          ...currentVerification,
-          status: pick?.aiAnalysis?.needsReview ? 'needs_review' : 'preliminary_ready',
-          preliminaryResult: pick?.aiAnalysis?.resultado || currentVerification.preliminaryResult || 'PENDIENTE',
-          confidence: pick?.aiAnalysis?.confianza ?? currentVerification.confidence ?? 0,
-          summary: pick?.aiAnalysis?.detalle || currentVerification.summary || 'Pick reabierto por inconformidad',
-          closedBy: null,
-          lastClosedAt: null
-        }
-      : {
-          ...currentVerification,
-          status: 'closed_by_admin',
-          needsReview: false,
-          summary: `Cierre final admin: ${String(result).toUpperCase()}`,
-          closedBy: req.user.id,
-          lastClosedAt: new Date()
-        };
-    const updatedPick = await Pick.findByIdAndUpdate(
-      req.params.id,
-      { result, verification: verificationPatch },
-      { new: true }
-    );
-    let tipsterStats = null;
-    if (pick.tipsterId) {
-      tipsterStats = await recalculateTipsterStats(pick.tipsterId);
-    }
-    res.json({ success: true, result: updatedPick?.result || result, tipsterStats, pick: updatedPick });
+    const resultPayload = await setOfficialResultForPick(req.params.id, result, req.user.id);
+    if (!resultPayload) return res.status(404).json({ error: 'Pick not found' });
+    res.json({
+      success: true,
+      result: resultPayload.updatedPick?.result || result,
+      tipsterStats: resultPayload.tipsterStats,
+      pick: resultPayload.updatedPick
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -979,6 +1252,166 @@ app.get('/api/admin/picks-all', auth, requireAdmin, async (req, res) => {
     const picks = await Pick.find().sort({ createdAt: -1 }).select('-ticketImg');
     res.json(picks);
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/picks-monitor', auth, requireAdmin, async (req, res) => {
+  try {
+    const monitor = await buildVerificationMonitorSnapshot({
+      pendingStaleHours: req.query.pendingStaleHours,
+      reviewStaleHours: req.query.reviewStaleHours,
+      lookbackHours: req.query.lookbackHours,
+      limit: req.query.limit
+    });
+    res.json(monitor);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/verification-alerts', auth, requireAdmin, async (req, res) => {
+  try {
+    const monitor = await buildVerificationMonitorSnapshot({
+      pendingStaleHours: req.query.pendingStaleHours,
+      reviewStaleHours: req.query.reviewStaleHours,
+      lookbackHours: req.query.lookbackHours,
+      limit: req.query.limit
+    });
+    const alerts = await buildVerificationAlerts({
+      monitor,
+      autoClosedLimit: req.query.autoClosedLimit
+    });
+    res.json({ monitor, ...alerts });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/picks/reanalyze-stale', auth, requireAdmin, async (req, res) => {
+  try {
+    const pendingStaleHours = parseHoursSetting(req.body?.pendingStaleHours ?? req.query.pendingStaleHours, DEFAULT_PENDING_STALE_HOURS);
+    const reviewStaleHours = parseHoursSetting(req.body?.reviewStaleHours ?? req.query.reviewStaleHours, DEFAULT_REVIEW_STALE_HOURS);
+    const limit = parseListLimit(req.body?.limit ?? req.query.limit, 60, 200);
+    const pendingCutoff = dateHoursAgo(pendingStaleHours);
+    const reviewCutoff = dateHoursAgo(reviewStaleHours);
+    const staleQuery = {
+      result: 'pending',
+      $or: [
+        { createdAt: { $lt: pendingCutoff } },
+        buildNeedsReviewStaleQuery(reviewCutoff),
+        buildPreliminaryReadyStaleQuery(pendingCutoff)
+      ]
+    };
+    const stalePicks = await Pick.find(staleQuery).sort({ createdAt: 1 }).limit(limit);
+    const summary = { total: stalePicks.length, analyzed: 0, failed: 0, autoClosed: 0, pending: 0, results: [] };
+    for (const pick of stalePicks) {
+      try {
+        const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
+        summary.analyzed += 1;
+        if (String(updated?.result || 'pending').toLowerCase() === 'pending') {
+          summary.pending += 1;
+        } else {
+          summary.autoClosed += 1;
+        }
+        summary.results.push({
+          pickId: String(pick._id),
+          result: updated?.result || 'pending',
+          status: updated?.verification?.status || 'pending',
+          confianza: Number(updated?.aiAnalysis?.confianza || 0),
+          resultado: updated?.aiAnalysis?.resultado || 'NECESITA_VERIFICACION'
+        });
+      } catch (error) {
+        summary.failed += 1;
+        summary.results.push({
+          pickId: String(pick._id),
+          error: error.message || 'analysis_failed'
+        });
+      }
+    }
+    const monitor = await buildVerificationMonitorSnapshot({
+      pendingStaleHours,
+      reviewStaleHours,
+      lookbackHours: req.body?.lookbackHours ?? req.query.lookbackHours,
+      limit: req.body?.monitorLimit ?? req.query.monitorLimit ?? req.query.limit
+    });
+    res.json({ success: true, staleThresholds: { pendingStaleHours, reviewStaleHours }, summary, monitor });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/picks/bulk-result', auth, requireAdmin, async (req, res) => {
+  try {
+    const rawPickIds = Array.isArray(req.body?.pickIds) ? req.body.pickIds : [];
+    const result = String(req.body?.result || '').trim().toLowerCase();
+    const pickIds = Array.from(new Set(rawPickIds.map((id) => String(id || '').trim()).filter(Boolean))).slice(0, 300);
+    if (!pickIds.length) return res.status(400).json({ error: 'pickIds requerido' });
+    if (!['won', 'lost', 'void', 'pending'].includes(result)) return res.status(400).json({ error: 'result inválido' });
+
+    const summary = { requested: pickIds.length, updated: 0, failed: 0, picks: [] };
+    for (const pickId of pickIds) {
+      try {
+        const updateResult = await setOfficialResultForPick(pickId, result, req.user.id);
+        if (!updateResult?.updatedPick) {
+          summary.failed += 1;
+          summary.picks.push({ pickId, error: 'not_found' });
+          continue;
+        }
+        summary.updated += 1;
+        summary.picks.push({
+          pickId,
+          result: updateResult.updatedPick.result,
+          status: updateResult.updatedPick?.verification?.status || 'pending'
+        });
+      } catch (error) {
+        summary.failed += 1;
+        summary.picks.push({ pickId, error: error.message || 'update_failed' });
+      }
+    }
+    res.json({ success: true, summary });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/picks/bulk-analyze', auth, requireAdmin, async (req, res) => {
+  try {
+    const rawPickIds = Array.isArray(req.body?.pickIds) ? req.body.pickIds : [];
+    const pickIds = Array.from(new Set(rawPickIds.map((id) => String(id || '').trim()).filter(Boolean))).slice(0, 300);
+    if (!pickIds.length) return res.status(400).json({ error: 'pickIds requerido' });
+    const picks = await Pick.find({ _id: { $in: pickIds } });
+    const byId = new Map(picks.map((pick) => [String(pick._id), pick]));
+    const summary = { requested: pickIds.length, found: picks.length, analyzed: 0, failed: 0, autoClosed: 0, pending: 0, results: [] };
+    for (const pickId of pickIds) {
+      const pick = byId.get(pickId);
+      if (!pick) {
+        summary.failed += 1;
+        summary.results.push({ pickId, error: 'not_found' });
+        continue;
+      }
+      try {
+        const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
+        summary.analyzed += 1;
+        if (String(updated?.result || 'pending').toLowerCase() === 'pending') {
+          summary.pending += 1;
+        } else {
+          summary.autoClosed += 1;
+        }
+        summary.results.push({
+          pickId,
+          result: updated?.result || 'pending',
+          status: updated?.verification?.status || 'pending',
+          confianza: Number(updated?.aiAnalysis?.confianza || 0),
+          resultado: updated?.aiAnalysis?.resultado || 'NECESITA_VERIFICACION'
+        });
+      } catch (error) {
+        summary.failed += 1;
+        summary.results.push({ pickId, error: error.message || 'analysis_failed' });
+      }
+    }
+    res.json({ success: true, summary });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/admin/reset-stats', auth, requireAdmin, async (req, res) => {
@@ -1979,37 +2412,25 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
   };
   return { bet: mergedBet, aiAnalysis, verification };
 }
-const AUTO_CLOSE_CONFIDENCE_THRESHOLD = Number.isFinite(Number(process.env.AUTO_CLOSE_CONFIDENCE_THRESHOLD))
-  ? Math.max(0, Math.min(100, Number(process.env.AUTO_CLOSE_CONFIDENCE_THRESHOLD)))
-  : 80;
-
-function mapAiOutcomeToPickResult(outcome) {
-  const normalized = toSafeString(outcome).toUpperCase();
-  if (['GANADO', 'WON'].includes(normalized)) return 'won';
-  if (['PERDIDO', 'LOST'].includes(normalized)) return 'lost';
-  if (['VOID', 'PUSH'].includes(normalized)) return 'void';
-  return null;
-}
 
 async function analyzeAndPersistPick(pick, options = {}) {
   const computed = await buildPreliminaryAnalysisForPick(pick, options);
-  const aiOutcome = mapAiOutcomeToPickResult(computed?.aiAnalysis?.resultado);
-  const aiConfidence = Number(computed?.aiAnalysis?.confianza ?? 0);
-  const canAutoClose = String(pick?.result || 'pending').toLowerCase() === 'pending';
-  const shouldAutoClose = Boolean(
-    canAutoClose &&
-    aiOutcome &&
-    !computed?.aiAnalysis?.needsReview &&
-    Number.isFinite(aiConfidence) &&
-    aiConfidence >= AUTO_CLOSE_CONFIDENCE_THRESHOLD
-  );
+  const autoCloseDecision = shouldAutoClosePick({
+    currentResult: pick?.result,
+    aiOutcome: computed?.aiAnalysis?.resultado,
+    needsReview: computed?.aiAnalysis?.needsReview,
+    confidence: computed?.aiAnalysis?.confianza,
+    marketType: computed?.bet?.marketType,
+    thresholdConfig: AUTO_CLOSE_THRESHOLD_CONFIG
+  });
+  const shouldAutoClose = Boolean(autoCloseDecision?.shouldAutoClose);
 
   if (shouldAutoClose) {
     computed.verification = {
       ...computed.verification,
       status: 'closed_auto',
       needsReview: false,
-      summary: `Cierre automático IA: ${computed?.aiAnalysis?.resultado || 'SIN RESULTADO'}`,
+      summary: `Cierre automático IA: ${computed?.aiAnalysis?.resultado || 'SIN RESULTADO'} (threshold ${autoCloseDecision.threshold})`,
       closedBy: null,
       lastClosedAt: new Date()
     };
@@ -2021,7 +2442,7 @@ async function analyzeAndPersistPick(pick, options = {}) {
     verification: computed.verification
   };
   if (shouldAutoClose) {
-    updatePayload.result = aiOutcome;
+    updatePayload.result = autoCloseDecision.resolvedResult;
   }
   const updated = await Pick.findByIdAndUpdate(
     pick._id,
@@ -2029,7 +2450,7 @@ async function analyzeAndPersistPick(pick, options = {}) {
     { new: true }
   );
   if (shouldAutoClose && pick?.tipsterId) {
-    await recalculateTipsterStats(pick.tipsterId);
+    await safeRecalculateTipsterStats(pick.tipsterId, `analyzeAndPersistPick:${pick?._id}`);
   }
   return updated;
 }
