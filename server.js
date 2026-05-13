@@ -257,6 +257,24 @@ const safeRecalculateTipsterStats = async (tipsterId, sourceLabel = 'unknown') =
     return null;
   }
 };
+
+const normalizeManualResultValue = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '';
+  if (normalized === 'voyd') return 'void';
+  if (normalized === 'push') return 'void';
+  return normalized;
+};
+
+const findPickByIdentifier = async (pickIdentifier) => {
+  const normalized = String(pickIdentifier || '').trim();
+  if (!normalized) return null;
+  if (mongoose.Types.ObjectId.isValid(normalized)) {
+    const byObjectId = await Pick.findById(normalized);
+    if (byObjectId) return byObjectId;
+  }
+  return await Pick.findOne({ id: normalized });
+};
 const AUTO_CLOSE_THRESHOLD_CONFIG = resolveAutoCloseThresholdConfig(process.env);
 
 const DEFAULT_PENDING_STALE_HOURS = Number.isFinite(Number(process.env.PICK_PENDING_STALE_HOURS))
@@ -327,14 +345,12 @@ function buildManualVerificationPatch(pickDoc, result, adminUserId) {
 }
 
 async function setOfficialResultForPick(pickId, result, adminUserId) {
-  const pick = await Pick.findById(pickId);
+  const pick = await findPickByIdentifier(pickId);
   if (!pick) return null;
   const verificationPatch = buildManualVerificationPatch(pick, result, adminUserId);
-  const updatedPick = await Pick.findByIdAndUpdate(
-    pickId,
-    { result, verification: verificationPatch },
-    { new: true }
-  );
+  pick.result = result;
+  pick.verification = verificationPatch;
+  const updatedPick = await pick.save();
   let tipsterStats = null;
   if (pick.tipsterId) {
     tipsterStats = await safeRecalculateTipsterStats(pick.tipsterId, `setOfficialResultForPick:${pickId}`);
@@ -1180,7 +1196,7 @@ app.post('/api/picks/:id/download', auth, async (req, res) => {
 
 app.put('/api/picks/:id/result', auth, requireAdmin, async (req, res) => {
   try {
-    const { result } = req.body;
+    const result = normalizeManualResultValue(req.body?.result);
     if (!['won','lost','void','pending'].includes(result)) return res.status(400).json({ error: 'Invalid result' });
     const resultPayload = await setOfficialResultForPick(req.params.id, result, req.user.id);
     if (!resultPayload) return res.status(404).json({ error: 'Pick not found' });
@@ -2557,9 +2573,16 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
 }
 
 async function analyzeAndPersistPick(pick, options = {}) {
-  const computed = await buildPreliminaryAnalysisForPick(pick, options);
+  const pickDoc = (pick && typeof pick.save === 'function')
+    ? pick
+    : await findPickByIdentifier(pick?._id || pick?.id);
+  if (!pickDoc) {
+    throw new Error('pick_not_found');
+  }
+
+  const computed = await buildPreliminaryAnalysisForPick(pickDoc, options);
   const autoCloseDecision = shouldAutoClosePick({
-    currentResult: pick?.result,
+    currentResult: pickDoc?.result,
     aiOutcome: computed?.aiAnalysis?.resultado,
     needsReview: computed?.aiAnalysis?.needsReview,
     confidence: computed?.aiAnalysis?.confianza,
@@ -2587,13 +2610,15 @@ async function analyzeAndPersistPick(pick, options = {}) {
   if (shouldAutoClose) {
     updatePayload.result = autoCloseDecision.resolvedResult;
   }
-  const updated = await Pick.findByIdAndUpdate(
-    pick._id,
-    { $set: updatePayload },
-    { new: true }
-  );
-  if (shouldAutoClose && pick?.tipsterId) {
-    await safeRecalculateTipsterStats(pick.tipsterId, `analyzeAndPersistPick:${pick?._id}`);
+  Object.entries(updatePayload).forEach(([key, value]) => {
+    pickDoc.set(key, value);
+  });
+  if (shouldAutoClose) {
+    pickDoc.set('result', autoCloseDecision.resolvedResult);
+  }
+  const updated = await pickDoc.save();
+  if (shouldAutoClose && pickDoc?.tipsterId) {
+    await safeRecalculateTipsterStats(pickDoc.tipsterId, `analyzeAndPersistPick:${pickDoc?._id}`);
   }
   return updated;
 }
@@ -2649,7 +2674,7 @@ app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
 
 app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
   try {
-    const pick = await Pick.findById(req.params.id);
+    const pick = await findPickByIdentifier(req.params.id);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
     const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
     res.json({
