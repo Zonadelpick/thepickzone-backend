@@ -834,6 +834,136 @@ async function buildWeeklyPayoutSummary(weekOffset = 0) {
   };
 }
 
+function normalizeWindowDays(value, fallback = 30) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(1, Math.min(365, Math.floor(parsed)));
+}
+
+function normalizeMinPicks(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.max(0, Math.min(10000, Math.floor(parsed)));
+}
+
+async function buildTipsterPickAnalysis(options = {}) {
+  const windowDays = normalizeWindowDays(options.windowDays, 30);
+  const minPicks = normalizeMinPicks(options.minPicks);
+  const limit = parseListLimit(options.limit, 30, 500);
+  const sinceDate = new Date(Date.now() - (windowDays * 24 * 60 * 60 * 1000));
+  const last24hDate = new Date(Date.now() - (24 * 60 * 60 * 1000));
+
+  const aggregates = await Pick.aggregate([
+    { $match: { createdAt: { $gte: sinceDate } } },
+    {
+      $group: {
+        _id: { tipsterId: '$tipsterId', tipster: '$tipster' },
+        totalPicks: { $sum: 1 },
+        pendingPicks: { $sum: { $cond: [{ $eq: ['$result', 'pending'] }, 1, 0] } },
+        wonPicks: { $sum: { $cond: [{ $eq: ['$result', 'won'] }, 1, 0] } },
+        lostPicks: { $sum: { $cond: [{ $eq: ['$result', 'lost'] }, 1, 0] } },
+        voidPicks: { $sum: { $cond: [{ $eq: ['$result', 'void'] }, 1, 0] } },
+        needsReviewPicks: { $sum: { $cond: [{ $eq: ['$verification.status', 'needs_review'] }, 1, 0] } },
+        autoClosedPicks: { $sum: { $cond: [{ $eq: ['$verification.status', 'closed_auto'] }, 1, 0] } },
+        avgOdds: { $avg: '$odds' },
+        avgPrice: { $avg: '$price' },
+        avgBank: { $avg: '$bank' },
+        avgConfidence: { $avg: '$verification.confidence' },
+        downloads: { $sum: { $ifNull: ['$downloadCount', 0] } },
+        buyersTotal: { $sum: { $size: { $ifNull: ['$buyers', []] } } },
+        picks24h: { $sum: { $cond: [{ $gte: ['$createdAt', last24hDate] }, 1, 0] } },
+        lastPickAt: { $max: '$createdAt' },
+        firstPickAt: { $min: '$createdAt' }
+      }
+    },
+    { $match: { totalPicks: { $gte: minPicks } } },
+    { $sort: { totalPicks: -1, picks24h: -1, lastPickAt: -1 } },
+    { $limit: limit }
+  ]);
+
+  const tipsterIds = aggregates
+    .map((entry) => String(entry?._id?.tipsterId || '').trim())
+    .filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const uniqueTipsterIds = Array.from(new Set(tipsterIds));
+  const tipsters = uniqueTipsterIds.length
+    ? await User.find({ _id: { $in: uniqueTipsterIds } }).select('_id name email username role')
+    : [];
+  const tipsterMap = new Map(tipsters.map((tipster) => [String(tipster._id), tipster]));
+
+  const data = aggregates.map((entry) => {
+    const tipsterId = String(entry?._id?.tipsterId || '').trim();
+    const tipsterDoc = tipsterMap.get(tipsterId);
+    const totalPicks = Number(entry?.totalPicks || 0);
+    const wonPicks = Number(entry?.wonPicks || 0);
+    const lostPicks = Number(entry?.lostPicks || 0);
+    const resolvedPicks = wonPicks + lostPicks + Number(entry?.voidPicks || 0);
+    const decisivePicks = wonPicks + lostPicks;
+    const hitRate = decisivePicks > 0 ? Number(((wonPicks / decisivePicks) * 100).toFixed(1)) : 0;
+    const closeRate = totalPicks > 0 ? Number(((resolvedPicks / totalPicks) * 100).toFixed(1)) : 0;
+    const pendingPicks = Number(entry?.pendingPicks || 0);
+    const needsReviewPicks = Number(entry?.needsReviewPicks || 0);
+    const reviewRisk = pendingPicks > 0
+      ? Number((((needsReviewPicks / pendingPicks) * 100)).toFixed(1))
+      : 0;
+    return {
+      tipsterId: tipsterId || null,
+      tipster: toSafeString(tipsterDoc?.name) || toSafeString(entry?._id?.tipster) || 'Sin nombre',
+      username: toSafeString(tipsterDoc?.username),
+      email: toSafeString(tipsterDoc?.email),
+      role: toSafeString(tipsterDoc?.role),
+      totalPicks,
+      picks24h: Number(entry?.picks24h || 0),
+      pendingPicks,
+      wonPicks,
+      lostPicks,
+      voidPicks: Number(entry?.voidPicks || 0),
+      resolvedPicks,
+      needsReviewPicks,
+      autoClosedPicks: Number(entry?.autoClosedPicks || 0),
+      downloads: Number(entry?.downloads || 0),
+      buyersTotal: Number(entry?.buyersTotal || 0),
+      avgOdds: Number(Number(entry?.avgOdds || 0).toFixed(2)),
+      avgPrice: Number(Number(entry?.avgPrice || 0).toFixed(2)),
+      avgBank: Number(Number(entry?.avgBank || 0).toFixed(2)),
+      avgConfidence: Number(Number(entry?.avgConfidence || 0).toFixed(1)),
+      hitRate,
+      closeRate,
+      reviewRisk,
+      firstPickAt: entry?.firstPickAt || null,
+      lastPickAt: entry?.lastPickAt || null
+    };
+  });
+
+  const totals = data.reduce((acc, row) => {
+    acc.totalPicks += row.totalPicks;
+    acc.pendingPicks += row.pendingPicks;
+    acc.resolvedPicks += row.resolvedPicks;
+    acc.wonPicks += row.wonPicks;
+    acc.lostPicks += row.lostPicks;
+    acc.voidPicks += row.voidPicks;
+    acc.needsReviewPicks += row.needsReviewPicks;
+    return acc;
+  }, {
+    totalPicks: 0,
+    pendingPicks: 0,
+    resolvedPicks: 0,
+    wonPicks: 0,
+    lostPicks: 0,
+    voidPicks: 0,
+    needsReviewPicks: 0
+  });
+
+  return {
+    generatedAt: new Date(),
+    filters: { windowDays, minPicks, limit },
+    totals: {
+      ...totals,
+      tipsters: data.length
+    },
+    tipsters: data
+  };
+}
+
 // ── AUTH ─────────────────────────────────────────────────────────────────────
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -1252,6 +1382,19 @@ app.get('/api/admin/picks-all', auth, requireAdmin, async (req, res) => {
     const picks = await Pick.find().sort({ createdAt: -1 }).select('-ticketImg');
     res.json(picks);
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/tipsters/pick-analysis', auth, requireAdmin, async (req, res) => {
+  try {
+    const analysis = await buildTipsterPickAnalysis({
+      windowDays: req.query.windowDays,
+      minPicks: req.query.minPicks,
+      limit: req.query.limit
+    });
+    res.json(analysis);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/api/admin/picks-monitor', auth, requireAdmin, async (req, res) => {
