@@ -2068,6 +2068,84 @@ function resolveStandardMarket(bet, score) {
   };
 }
 
+async function resolveAiVerdictFallbackForStandardMarket({ pick, bet, score, baseResolution, ocrMeta }) {
+  const base = baseResolution && typeof baseResolution === 'object' ? baseResolution : {};
+  const baseOutcome = String(base.resultado || '').trim().toUpperCase();
+  if (['GANADO', 'PERDIDO', 'VOID'].includes(baseOutcome)) return base;
+  if (!score?.completed) return base;
+  if (!process.env.ANTHROPIC_API_KEY) return base;
+
+  const prompt = `Eres un árbitro de apuestas deportivas.
+Debes responder SOLO JSON válido con:
+{
+  "resultado":"GANADO|PERDIDO|VOID|NECESITA_VERIFICACION",
+  "confianza":0-100,
+  "detalle":"explicación corta",
+  "needsReview":true|false
+}
+Reglas:
+- Si la evidencia alcanza, prioriza GANADO/PERDIDO/VOID.
+- Usa NECESITA_VERIFICACION solo si no es posible decidir.
+
+Datos del ticket/pick:
+- match: ${toSafeString(pick?.match)}
+- league: ${toSafeString(pick?.league)}
+- marketType: ${toSafeString(bet?.marketType)}
+- selection: ${toSafeString(bet?.selection)}
+- selectionLabel: ${toSafeString(bet?.selectionLabel)}
+- side: ${toSafeString(bet?.side)}
+- line: ${bet?.line ?? null}
+- homeTeam: ${toSafeString(bet?.homeTeam)}
+- awayTeam: ${toSafeString(bet?.awayTeam)}
+- ocrRaw: ${toSafeString(ocrMeta?.raw?.answer || '').slice(0, 2000)}
+
+Resultado oficial:
+- home: ${toSafeString(score?.home)}
+- away: ${toSafeString(score?.away)}
+- homeScore: ${score?.homeScore ?? null}
+- awayScore: ${score?.awayScore ?? null}
+- completed: ${Boolean(score?.completed)}`;
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-7',
+      max_tokens: 450,
+      cache_control: { type: 'ephemeral' },
+      thinking: { type: 'adaptive' },
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }]
+    });
+    const answer = Array.isArray(response?.content)
+      ? response.content.map((chunk) => chunk?.text || '').join('\n')
+      : '';
+    const parsed = extractJsonObject(answer);
+    const resultado = String(parsed?.resultado || '').trim().toUpperCase();
+    if (!['GANADO', 'PERDIDO', 'VOID', 'NECESITA_VERIFICACION'].includes(resultado)) return base;
+
+    const confianza = clampNumber(parsed?.confianza ?? 0, 0, 100, 0);
+    const detalle = toSafeString(parsed?.detalle || 'Dictamen IA sin detalle');
+    const needsReview = Boolean(parsed?.needsReview);
+
+    return {
+      ...base,
+      resultado,
+      confianza,
+      detalle,
+      needsReview,
+      evidence: [
+        ...(Array.isArray(base?.evidence) ? base.evidence : []),
+        {
+          provider: 'anthropic',
+          type: 'ai-verdict-fallback',
+          detail: detalle,
+          value: { resultado, confianza, needsReview }
+        }
+      ]
+    };
+  } catch {
+    return base;
+  }
+}
+
 async function extractTicketBetWithVision(pick, currentBet) {
   if (!process.env.ANTHROPIC_API_KEY) {
     return { bet: null, meta: { status: 'not_attempted', confidence: 0, warnings: ['ANTHROPIC_API_KEY no configurado'] } };
@@ -2535,6 +2613,13 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
       mergedBet.eventId
     );
     resolution = resolveStandardMarket(mergedBet, score);
+    resolution = await resolveAiVerdictFallbackForStandardMarket({
+      pick,
+      bet: mergedBet,
+      score,
+      baseResolution: resolution,
+      ocrMeta
+    });
   }
   const aiAnalysis = {
     resultado: resolution.resultado || 'NECESITA_VERIFICACION',
