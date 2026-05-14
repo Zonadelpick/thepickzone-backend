@@ -709,6 +709,12 @@ const buildFrontendBaseUrl = () => {
   const value = String(process.env.FRONTEND_BASE_URL || process.env.FRONTEND_URL || process.env.APP_BASE_URL || '').trim();
   return value.replace(/\/+$/, '');
 };
+const resolveEmailVerificationRequired = () => {
+  const explicit = String(process.env.AUTH_REQUIRE_EMAIL_VERIFICATION || '').trim().toLowerCase();
+  if (explicit === 'true') return true;
+  if (explicit === 'false') return false;
+  return Boolean(String(process.env.RESEND_API_KEY || '').trim());
+};
 
 const sendVerificationWelcomeEmail = async ({ toEmail, fullName, verificationLink }) => {
   const resendKey = String(process.env.RESEND_API_KEY || '').trim();
@@ -1212,6 +1218,7 @@ app.post('/api/auth/register', async (req, res) => {
     if (exists) return res.status(400).json({ error: 'Email ya registrado' });
     const username = await resolveAvailableUsername(buildDefaultUsername(normalizedName, normalizedEmail));
     if (!username) return res.status(400).json({ error: 'Username inválido' });
+    const emailVerificationRequired = resolveEmailVerificationRequired();
     const verificationPayload = buildEmailVerificationPayload();
     const hash = await bcrypt.hash(password, 10);
     const user = await User.create({
@@ -1219,7 +1226,8 @@ app.post('/api/auth/register', async (req, res) => {
       username,
       email: normalizedEmail,
       password: hash,
-      emailVerified: false,
+      emailVerified: !emailVerificationRequired,
+      emailVerifiedAt: emailVerificationRequired ? null : new Date(),
       emailVerificationTokenHash: verificationPayload.tokenHash,
       emailVerificationExpiresAt: verificationPayload.expiresAt
     });
@@ -1228,22 +1236,35 @@ app.post('/api/auth/register', async (req, res) => {
     const verificationLink = frontendBaseUrl
       ? `${frontendBaseUrl}/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`
       : `https://thepickzone.mx/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`;
-    let emailDelivery = { sent: false, reason: 'missing_config' };
-    try {
-      emailDelivery = await sendVerificationWelcomeEmail({
-        toEmail: normalizedEmail,
-        fullName: normalizedName,
-        verificationLink
-      });
-    } catch (mailError) {
-      console.error('[Auth/Register] sendVerificationWelcomeEmail error:', mailError.message || mailError);
-      emailDelivery = { sent: false, reason: 'send_failed' };
+    let emailDelivery = { sent: false, reason: 'verification_not_required' };
+    if (emailVerificationRequired) {
+      emailDelivery = { sent: false, reason: 'missing_config' };
+      try {
+        emailDelivery = await sendVerificationWelcomeEmail({
+          toEmail: normalizedEmail,
+          fullName: normalizedName,
+          verificationLink
+        });
+      } catch (mailError) {
+        console.error('[Auth/Register] sendVerificationWelcomeEmail error:', mailError.message || mailError);
+        emailDelivery = { sent: false, reason: 'send_failed' };
+      }
+      if (!emailDelivery?.sent) {
+        await User.findByIdAndUpdate(user._id, {
+          emailVerified: true,
+          emailVerifiedAt: new Date()
+        });
+        user.emailVerified = true;
+        user.emailVerifiedAt = new Date();
+      }
     }
 
     res.json({
       success: true,
-      requiresEmailVerification: true,
-      message: 'Registro exitoso. Revisa tu correo para activar tu cuenta.',
+      requiresEmailVerification: Boolean(emailVerificationRequired && emailDelivery?.sent),
+      message: emailVerificationRequired && emailDelivery?.sent
+        ? 'Registro exitoso. Revisa tu correo para activar tu cuenta.'
+        : 'Registro exitoso. Ya puedes iniciar sesión.',
       emailSent: Boolean(emailDelivery.sent),
       emailDeliveryReason: emailDelivery.reason || null,
       user: {
@@ -1282,6 +1303,66 @@ app.get('/api/auth/verify-email', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+app.post('/api/auth/resend-verification', async (req, res) => {
+  try {
+    const emailVerificationRequired = resolveEmailVerificationRequired();
+    if (!emailVerificationRequired) {
+      return res.json({
+        success: true,
+        requiresEmailVerification: false,
+        message: 'La verificación por correo está desactivada en este momento.'
+      });
+    }
+    const normalizedEmail = String(req.body?.email || '').trim().toLowerCase();
+    if (!normalizedEmail) return res.status(400).json({ error: 'Email requerido' });
+    const user = await User.findOne({ email: normalizedEmail }).select('_id name email emailVerified');
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (user.emailVerified) {
+      return res.json({
+        success: true,
+        alreadyVerified: true,
+        message: 'Este correo ya está verificado.'
+      });
+    }
+
+    const verificationPayload = buildEmailVerificationPayload();
+    await User.findByIdAndUpdate(user._id, {
+      emailVerificationTokenHash: verificationPayload.tokenHash,
+      emailVerificationExpiresAt: verificationPayload.expiresAt
+    });
+    const frontendBaseUrl = buildFrontendBaseUrl();
+    const verificationLink = frontendBaseUrl
+      ? `${frontendBaseUrl}/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`
+      : `https://thepickzone.mx/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`;
+    let emailDelivery = { sent: false, reason: 'missing_config' };
+    try {
+      emailDelivery = await sendVerificationWelcomeEmail({
+        toEmail: normalizedEmail,
+        fullName: user.name,
+        verificationLink
+      });
+    } catch (mailError) {
+      console.error('[Auth/ResendVerification] sendVerificationWelcomeEmail error:', mailError.message || mailError);
+      emailDelivery = { sent: false, reason: 'send_failed' };
+    }
+    if (!emailDelivery?.sent) {
+      return res.status(503).json({
+        error: 'No se pudo enviar el correo de verificación en este momento.',
+        requiresEmailVerification: true,
+        emailSent: false,
+        emailDeliveryReason: emailDelivery.reason || 'send_failed'
+      });
+    }
+    res.json({
+      success: true,
+      requiresEmailVerification: true,
+      emailSent: true,
+      message: 'Correo de verificación reenviado. Revisa tu bandeja de entrada.'
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.post('/api/auth/login', async (req, res) => {
   try {
@@ -1292,6 +1373,12 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user) return res.status(400).json({ error: 'Usuario no encontrado' });
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(400).json({ error: 'Contraseña incorrecta' });
+    const emailVerificationRequired = resolveEmailVerificationRequired();
+    if (!user.emailVerified && !emailVerificationRequired) {
+      user.emailVerified = true;
+      user.emailVerifiedAt = new Date();
+      await user.save();
+    }
     if (!user.emailVerified) {
       return res.status(403).json({
         error: 'Debes verificar tu correo antes de iniciar sesión',
