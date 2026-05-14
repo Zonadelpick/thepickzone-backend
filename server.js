@@ -1750,6 +1750,53 @@ app.get('/api/admin/users', auth, requireAdmin, async (req, res) => {
     res.json(users);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+app.delete('/api/admin/users/:id', auth, requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.params?.id || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ error: 'Usuario inválido' });
+    }
+    if (String(req.user?.id || '') === userId) {
+      return res.status(400).json({ error: 'No puedes eliminar tu propio usuario admin' });
+    }
+
+    const targetUser = await User.findById(userId).select('_id name email role');
+    if (!targetUser) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const protectedEmails = new Set(['admin@thepickzone.com']);
+    if (protectedEmails.has(String(targetUser.email || '').trim().toLowerCase())) {
+      return res.status(400).json({ error: 'Este usuario está protegido y no se puede eliminar' });
+    }
+
+    const tipsterPicks = await Pick.find({ tipsterId: userId }).select('_id');
+    const tipsterPickIds = tipsterPicks.map((pickDoc) => pickDoc?._id).filter(Boolean);
+
+    const [removedPurchasesByBuyer, removedPayouts, pullBuyerRefsResult, removedPurchasesByTipsterPicks, removedTipsterPicks] = await Promise.all([
+      Purchase.deleteMany({ buyerId: userId }),
+      WeeklyTipsterPayout.deleteMany({ tipsterId: userId }),
+      Pick.updateMany({ buyers: userId }, { $pull: { buyers: userId } }),
+      tipsterPickIds.length ? Purchase.deleteMany({ pickId: { $in: tipsterPickIds } }) : Promise.resolve({ deletedCount: 0 }),
+      Pick.deleteMany({ tipsterId: userId })
+    ]);
+
+    await User.findByIdAndDelete(userId);
+
+    res.json({
+      success: true,
+      removedUserId: userId,
+      removedUserEmail: targetUser.email,
+      removedUserName: targetUser.name,
+      cleanup: {
+        purchasesByBuyerDeleted: Number(removedPurchasesByBuyer?.deletedCount || 0),
+        weeklyPayoutsDeleted: Number(removedPayouts?.deletedCount || 0),
+        picksWithBuyerReferenceUpdated: Number(pullBuyerRefsResult?.modifiedCount || 0),
+        purchasesOfTipsterPicksDeleted: Number(removedPurchasesByTipsterPicks?.deletedCount || 0),
+        tipsterPicksDeleted: Number(removedTipsterPicks?.deletedCount || 0)
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/api/admin/revenue/weekly-payouts', auth, requireAdmin, async (req, res) => {
   try {
