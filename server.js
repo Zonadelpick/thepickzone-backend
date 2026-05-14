@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const axios = require('axios');
+const crypto = require('crypto');
 const Stripe = require('stripe');
 const {
   resolveAutoCloseThresholdConfig,
@@ -31,6 +32,15 @@ if (!STRIPE_SECRET_KEY) {
   throw new Error('Stripe no configurado: define STRIPE_SECRET_KEY o STRIPE_LIVE_SECRET_KEY/STRIPE_TEST_SECRET_KEY');
 }
 const STRIPE_MODE = STRIPE_SECRET_KEY.startsWith('sk_live_') ? 'live' : 'test';
+const STRIPE_LIVE_REQUIRED = (() => {
+  const explicit = String(process.env.STRIPE_REQUIRE_LIVE || '').trim().toLowerCase();
+  if (explicit === 'true') return true;
+  if (explicit === 'false') return false;
+  return String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
+})();
+if (STRIPE_LIVE_REQUIRED && STRIPE_MODE !== 'live') {
+  throw new Error('Stripe live requerido: configura STRIPE_SECRET_KEY con una clave sk_live_ y desactiva credenciales de prueba.');
+}
 console.log(`[Stripe] initialized in ${STRIPE_MODE} mode`);
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 const PRO_PLAN_AMOUNT_USD = 29.99;
@@ -66,6 +76,10 @@ const UserSchema = new mongoose.Schema({
   bankClabeLast4: { type: String, default: '' },
   bankAccountHolder: { type: String, default: '' },
   bankName: { type: String, default: '' },
+  emailVerified: { type: Boolean, default: false },
+  emailVerifiedAt: { type: Date },
+  emailVerificationTokenHash: { type: String, default: '' },
+  emailVerificationExpiresAt: { type: Date },
   stripeConnectedAccountId: { type: String, default: '' },
   stripeExternalAccountId: { type: String, default: '' },
   stripePayoutReady: { type: Boolean, default: false },
@@ -142,6 +156,7 @@ const PickSchema = new mongoose.Schema({
   ticketImg:  { type: String },
   result:     { type: String, default: 'pending', enum: ['pending','won','lost','void'] },
   buyers:     [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  salesCount: { type: Number, default: 0 },
   downloadCount: { type: Number, default: 0 },
   bet:        { type: PickBetSchema, default: () => ({ source: 'manual' }) },
   verification: { type: PickVerificationSchema, default: () => ({}) },
@@ -247,6 +262,25 @@ const calculateTipsterStatsFromPicks = (resolvedPicks) => {
     pushPicks,
     avgOdds
   };
+};
+const resolveConnectReturnUrls = (req) => {
+  const bodyRefreshUrl = toSafeString(req.body?.refreshUrl);
+  const bodyReturnUrl = toSafeString(req.body?.returnUrl);
+  if (isValidHttpUrl(bodyRefreshUrl) && isValidHttpUrl(bodyReturnUrl)) {
+    return {
+      refreshUrl: bodyRefreshUrl,
+      returnUrl: bodyReturnUrl
+    };
+  }
+  const frontendBaseUrl = buildFrontendBaseUrl();
+  if (isValidHttpUrl(frontendBaseUrl)) {
+    const normalizedBase = frontendBaseUrl.replace(/\/+$/, '');
+    return {
+      refreshUrl: `${normalizedBase}/?stripe=connect-refresh`,
+      returnUrl: `${normalizedBase}/?stripe=connect-return`
+    };
+  }
+  return null;
 };
 
 const recalculateTipsterStats = async (tipsterId) => {
@@ -648,6 +682,80 @@ const resolveAvailableUsername = async (desiredUsername, excludeUserId = null) =
   return `${base.slice(0, 16)}-${Date.now().toString(36).slice(-7)}`.slice(0, 24);
 };
 
+const EMAIL_FORMAT_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i;
+const FULL_NAME_REGEX = /^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+(?:[ '-][A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+)+$/;
+
+const isValidFunctionalEmail = (email) => {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!normalized || normalized.length > 120) return false;
+  return EMAIL_FORMAT_REGEX.test(normalized);
+};
+
+const isValidFullName = (name) => {
+  const normalized = normalizeTextField(name, 80);
+  if (!normalized) return false;
+  if (normalized.length < 5) return false;
+  return FULL_NAME_REGEX.test(normalized);
+};
+
+const buildEmailVerificationPayload = () => {
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  const expiresAt = new Date(Date.now() + (24 * 60 * 60 * 1000));
+  return { rawToken, tokenHash, expiresAt };
+};
+
+const buildFrontendBaseUrl = () => {
+  const value = String(process.env.FRONTEND_BASE_URL || process.env.FRONTEND_URL || process.env.APP_BASE_URL || '').trim();
+  return value.replace(/\/+$/, '');
+};
+
+const sendVerificationWelcomeEmail = async ({ toEmail, fullName, verificationLink }) => {
+  const resendKey = String(process.env.RESEND_API_KEY || '').trim();
+  const fromEmail = String(process.env.EMAIL_FROM || process.env.RESEND_FROM || 'The Pick Zone <noreply@thepickzone.mx>').trim();
+  const subject = 'Bienvenido a The Pick Zone · Verifica tu correo';
+  const html = `
+    <div style="font-family:Arial,sans-serif;color:#101114;line-height:1.6;">
+      <h2 style="margin-bottom:8px;">¡Bienvenido a The Pick Zone! 👋</h2>
+      <p>Hola ${String(fullName || 'Tipster').replace(/[<>]/g, '')},</p>
+      <p>Gracias por registrarte. Para activar tu cuenta y mantener la comunidad protegida contra usuarios falsos, confirma tu correo electrónico en el siguiente botón:</p>
+      <p style="margin:22px 0;">
+        <a href="${verificationLink}" style="background:#1DB954;color:#000;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:6px;display:inline-block;">
+          Activar mi cuenta
+        </a>
+      </p>
+      <p>Si no solicitaste este registro, puedes ignorar este mensaje.</p>
+      <p style="font-size:12px;color:#5e6770;">Este enlace vence en 24 horas.</p>
+    </div>
+  `;
+  const text = `¡Bienvenido a The Pick Zone!\n\nHola ${fullName || 'Tipster'},\nGracias por registrarte. Para activar tu cuenta y validar tu correo, usa este enlace:\n${verificationLink}\n\nSi no solicitaste este registro, ignora este mensaje.\n\nEste enlace vence en 24 horas.`;
+
+  if (!resendKey) {
+    console.log(`[Auth] RESEND_API_KEY no configurada. Correo de verificación pendiente para ${toEmail}.`);
+    return { sent: false, reason: 'missing_resend_api_key' };
+  }
+
+  await axios.post(
+    'https://api.resend.com/emails',
+    {
+      from: fromEmail,
+      to: [toEmail],
+      subject,
+      html,
+      text
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${resendKey}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    }
+  );
+
+  return { sent: true };
+};
+
 const CLABE_WEIGHTS = [3, 7, 1];
 
 const normalizeDigits = (value) => String(value || '').replace(/\D+/g, '');
@@ -691,15 +799,73 @@ async function ensureTipsterStripeAccount(userDoc) {
   const existingAccountId = toSafeString(userDoc?.stripeConnectedAccountId);
   if (existingAccountId) return existingAccountId;
   const account = await stripe.accounts.create({
-    type: 'custom',
+    type: 'express',
     country: 'MX',
     email: userDoc?.email || undefined,
     business_type: 'individual',
     capabilities: { transfers: { requested: true } },
-    settings: { payouts: { schedule: { interval: 'manual' } } },
     metadata: { tpzUserId: String(userDoc?._id || '') }
   });
   return toSafeString(account?.id);
+}
+const resolveConnectAccountPayoutStatus = (accountSnapshot) => {
+  const transfersActive = accountSnapshot?.capabilities?.transfers === 'active';
+  const payoutsEnabled = Boolean(accountSnapshot?.payouts_enabled);
+  const pendingRequirementsCount = Array.isArray(accountSnapshot?.requirements?.currently_due)
+    ? accountSnapshot.requirements.currently_due.length
+    : 0;
+  const payoutReady = Boolean(transfersActive && payoutsEnabled && pendingRequirementsCount === 0);
+  return {
+    payoutReady,
+    payoutStatus: payoutReady ? 'configured' : 'pending_verification',
+    requirementsDue: pendingRequirementsCount
+  };
+};
+
+async function hydrateUserStripePayoutState(userDoc, options = {}) {
+  const persist = options?.persist !== false;
+  const userId = userDoc?._id;
+  const stripeConnectedAccountId = toSafeString(userDoc?.stripeConnectedAccountId);
+  if (!userId || !stripeConnectedAccountId) return userDoc;
+
+  const accountSnapshot = await stripe.accounts.retrieve(stripeConnectedAccountId);
+  const externalAccounts = Array.isArray(accountSnapshot?.external_accounts?.data)
+    ? accountSnapshot.external_accounts.data
+    : [];
+  const externalBankAccount = externalAccounts.find((entry) => String(entry?.object || '').toLowerCase() === 'bank_account') || null;
+  const stripeExternalAccountId = toSafeString(userDoc?.stripeExternalAccountId) || toSafeString(externalBankAccount?.id);
+  const bankClabeLast4 = toSafeString(userDoc?.bankClabeLast4) || (toSafeString(userDoc?.bankClabeMasked).match(/(\d{4})$/)?.[1] || '') || toSafeString(externalBankAccount?.last4);
+  const bankClabeMasked = toSafeString(userDoc?.bankClabeMasked) || (bankClabeLast4 ? `**************${bankClabeLast4}` : '');
+  const payoutState = resolveConnectAccountPayoutStatus(accountSnapshot);
+  const payoutReady = Boolean(payoutState.payoutReady && stripeExternalAccountId && bankClabeLast4);
+  const payoutStatus = payoutReady
+    ? 'configured'
+    : payoutState.requirementsDue > 0
+      ? 'pending_verification'
+      : 'onboarding_required';
+
+  const hydrated = {
+    ...(userDoc?.toObject ? userDoc.toObject() : userDoc),
+    stripeConnectedAccountId,
+    stripeExternalAccountId,
+    bankClabeMasked,
+    bankClabeLast4,
+    stripePayoutReady: payoutReady,
+    stripePayoutStatus: payoutStatus
+  };
+
+  if (persist) {
+    await User.findByIdAndUpdate(userId, {
+      stripeConnectedAccountId,
+      stripeExternalAccountId,
+      bankClabeMasked,
+      bankClabeLast4,
+      stripePayoutReady: payoutReady,
+      stripePayoutStatus: payoutStatus
+    });
+  }
+
+  return hydrated;
 }
 
 async function configureTipsterBankDestination(userDoc, { clabe, accountHolder, bankName }) {
@@ -729,10 +895,7 @@ async function configureTipsterBankDestination(userDoc, { clabe, accountHolder, 
     default_for_currency: true
   });
   const accountSnapshot = await stripe.accounts.retrieve(stripeAccountId);
-  const payoutReady = Boolean(
-    accountSnapshot?.payouts_enabled ||
-    accountSnapshot?.capabilities?.transfers === 'active'
-  );
+  const payoutState = resolveConnectAccountPayoutStatus(accountSnapshot);
   return {
     bankClabeMasked: maskClabe(clabeDigits),
     bankClabeLast4: clabeDigits.slice(-4),
@@ -740,22 +903,46 @@ async function configureTipsterBankDestination(userDoc, { clabe, accountHolder, 
     bankName: toSafeString(bankName),
     stripeConnectedAccountId: stripeAccountId,
     stripeExternalAccountId: toSafeString(externalAccount?.id),
-    stripePayoutReady: payoutReady,
-    stripePayoutStatus: payoutReady ? 'configured' : 'pending_verification'
+    stripePayoutReady: payoutState.payoutReady,
+    stripePayoutStatus: payoutState.payoutStatus
   };
+}
+function isStripeConnectUnavailableError(error) {
+  const message = String(error?.message || '').toLowerCase();
+  const code = String(error?.code || '').toLowerCase();
+  const rawCode = String(error?.raw?.code || '').toLowerCase();
+  return (
+    message.includes('signed up for connect') ||
+    (message.includes('connect') && (message.includes('not enabled') || message.includes('not available'))) ||
+    code === 'feature_not_enabled' ||
+    rawCode === 'feature_not_enabled'
+  );
 }
 
 function formatWeeklyPayoutEntry(recordDoc, tipsterDoc) {
+  const stripeConnectedAccountId = toSafeString(tipsterDoc?.stripeConnectedAccountId);
+  const stripeExternalAccountId = toSafeString(tipsterDoc?.stripeExternalAccountId);
+  const bankClabeMasked = toSafeString(tipsterDoc?.bankClabeMasked);
+  const bankClabeLast4 = toSafeString(tipsterDoc?.bankClabeLast4) || (bankClabeMasked.match(/(\d{4})$/)?.[1] || '');
+  const payoutActionReady = Boolean(
+    stripeConnectedAccountId &&
+    stripeExternalAccountId &&
+    bankClabeMasked &&
+    bankClabeLast4
+  );
   return {
     _id: String(recordDoc?._id || ''),
     tipsterId: String(recordDoc?.tipsterId || tipsterDoc?._id || ''),
     tipsterName: toSafeString(tipsterDoc?.name),
     tipsterEmail: toSafeString(tipsterDoc?.email),
-    bankClabeMasked: toSafeString(tipsterDoc?.bankClabeMasked),
+    bankClabeMasked,
+    bankClabeLast4,
     bankAccountHolder: toSafeString(tipsterDoc?.bankAccountHolder),
     bankName: toSafeString(tipsterDoc?.bankName),
-    stripeConnectedAccountId: toSafeString(tipsterDoc?.stripeConnectedAccountId),
+    stripeConnectedAccountId,
+    stripeExternalAccountId,
     stripePayoutReady: Boolean(tipsterDoc?.stripePayoutReady),
+    payoutActionReady,
     status: toSafeString(recordDoc?.status) || 'pending',
     salesCount: Number(recordDoc?.salesCount || 0),
     grossAmount: centsToAmount(recordDoc?.grossCents || 0),
@@ -771,7 +958,7 @@ function formatWeeklyPayoutEntry(recordDoc, tipsterDoc) {
 
 async function buildWeeklyPayoutSummary(weekOffset = 0) {
   const { weekStart, weekEnd } = resolveWeekRange(weekOffset);
-  const proUsers = await User.find({ role: { $in: ['pro', 'tipster'] } }).select('name email bankClabeMasked bankAccountHolder bankName stripeConnectedAccountId stripePayoutReady stripePayoutStatus');
+  const proUsers = await User.find({ role: { $in: ['pro', 'tipster'] } }).select('name email bankClabeMasked bankClabeLast4 bankAccountHolder bankName stripeConnectedAccountId stripeExternalAccountId stripePayoutReady stripePayoutStatus');
   const purchases = await Purchase.find({ createdAt: { $gte: weekStart, $lt: weekEnd } }).select('pickId amountCents currency createdAt');
   const pickIds = Array.from(new Set(purchases.map((item) => String(item.pickId || '')).filter(Boolean)));
   const picks = pickIds.length > 0
@@ -836,7 +1023,21 @@ async function buildWeeklyPayoutSummary(weekOffset = 0) {
       );
     }
 
-    if (payoutDoc) formattedPayouts.push(formatWeeklyPayoutEntry(payoutDoc, tipster));
+    let tipsterSnapshot = tipster;
+    if (
+      toSafeString(tipster?.stripeConnectedAccountId) &&
+      (
+        !tipster?.stripePayoutReady ||
+        !toSafeString(tipster?.stripeExternalAccountId) ||
+        !toSafeString(tipster?.bankClabeLast4)
+      )
+    ) {
+      try {
+        tipsterSnapshot = await hydrateUserStripePayoutState(tipster, { persist: true });
+      } catch {}
+    }
+
+    if (payoutDoc) formattedPayouts.push(formatWeeklyPayoutEntry(payoutDoc, tipsterSnapshot));
   }
 
   const totals = formattedPayouts.reduce((acc, row) => {
@@ -998,31 +1199,88 @@ app.post('/api/auth/register', async (req, res) => {
     const normalizedName = normalizeTextField(name, 60);
     const normalizedEmail = String(email || '').trim().toLowerCase();
     if (!normalizedName || !normalizedEmail || !password) return res.status(400).json({ error: 'Faltan campos' });
+    if (!isValidFullName(normalizedName)) {
+      return res.status(400).json({ error: 'Nombre completo obligatorio (nombre y apellido)' });
+    }
+    if (!isValidFunctionalEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'Correo electrónico inválido' });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+    }
     const exists = await User.findOne({ email: normalizedEmail });
     if (exists) return res.status(400).json({ error: 'Email ya registrado' });
     const username = await resolveAvailableUsername(buildDefaultUsername(normalizedName, normalizedEmail));
     if (!username) return res.status(400).json({ error: 'Username inválido' });
+    const verificationPayload = buildEmailVerificationPayload();
     const hash = await bcrypt.hash(password, 10);
     const user = await User.create({
       name: normalizedName,
       username,
       email: normalizedEmail,
-      password: hash
+      password: hash,
+      emailVerified: false,
+      emailVerificationTokenHash: verificationPayload.tokenHash,
+      emailVerificationExpiresAt: verificationPayload.expiresAt
     });
-    const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET || 'thepickzone_secret_2026', { expiresIn: '7d' });
+
+    const frontendBaseUrl = buildFrontendBaseUrl();
+    const verificationLink = frontendBaseUrl
+      ? `${frontendBaseUrl}/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`
+      : `https://thepickzone.mx/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`;
+    let emailDelivery = { sent: false, reason: 'missing_config' };
+    try {
+      emailDelivery = await sendVerificationWelcomeEmail({
+        toEmail: normalizedEmail,
+        fullName: normalizedName,
+        verificationLink
+      });
+    } catch (mailError) {
+      console.error('[Auth/Register] sendVerificationWelcomeEmail error:', mailError.message || mailError);
+      emailDelivery = { sent: false, reason: 'send_failed' };
+    }
+
     res.json({
-      token,
+      success: true,
+      requiresEmailVerification: true,
+      message: 'Registro exitoso. Revisa tu correo para activar tu cuenta.',
+      emailSent: Boolean(emailDelivery.sent),
+      emailDeliveryReason: emailDelivery.reason || null,
       user: {
         _id: user._id,
         name: user.name,
         username: user.username,
         email: user.email,
         role: user.role,
-        avatar: user.avatar,
-        bio: user.bio
+        emailVerified: user.emailVerified
       }
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/auth/verify-email', async (req, res) => {
+  try {
+    const rawToken = String(req.query?.token || '').trim();
+    if (!rawToken) return res.status(400).json({ error: 'Token requerido' });
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const user = await User.findOne({
+      emailVerificationTokenHash: tokenHash,
+      emailVerificationExpiresAt: { $gt: new Date() }
+    }).select('_id email emailVerified');
+    if (!user) {
+      return res.status(400).json({ error: 'Token inválido o expirado' });
+    }
+    if (user.emailVerified) {
+      return res.json({ success: true, message: 'El correo ya estaba verificado.' });
+    }
+    user.emailVerified = true;
+    user.emailVerifiedAt = new Date();
+    user.emailVerificationTokenHash = '';
+    user.emailVerificationExpiresAt = null;
+    await user.save();
+    res.json({ success: true, message: 'Correo verificado correctamente. Ya puedes iniciar sesión.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -1034,6 +1292,12 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user) return res.status(400).json({ error: 'Usuario no encontrado' });
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(400).json({ error: 'Contraseña incorrecta' });
+    if (!user.emailVerified) {
+      return res.status(403).json({
+        error: 'Debes verificar tu correo antes de iniciar sesión',
+        requiresEmailVerification: true
+      });
+    }
     if (user.role === 'pro' && user.proExpiry && new Date() > user.proExpiry) {
       await User.findByIdAndUpdate(user._id, { role: 'basic' });
       user.role = 'basic';
@@ -1047,6 +1311,7 @@ app.post('/api/auth/login', async (req, res) => {
         username: user.username,
         email: user.email,
         role: user.role,
+        emailVerified: Boolean(user.emailVerified),
         avatar: user.avatar,
         bio: user.bio,
         roi: user.roi,
@@ -1085,7 +1350,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
 app.put('/api/auth/profile', auth, async (req, res) => {
   try {
     const { name, avatar, bio, username, clabe, bankAccountHolder, bankName } = req.body;
-    const currentUser = await User.findById(req.user.id).select('name email stripeConnectedAccountId stripeExternalAccountId bankName bankAccountHolder');
+    const currentUser = await User.findById(req.user.id).select('name email stripeConnectedAccountId stripeExternalAccountId bankName bankAccountHolder stripePayoutReady stripePayoutStatus');
     if (!currentUser) return res.status(404).json({ error: 'User not found' });
     const updates = {};
 
@@ -1125,10 +1390,8 @@ app.put('/api/auth/profile', auth, async (req, res) => {
       typeof bankAccountHolder === 'string' ||
       typeof bankName === 'string'
     );
+    let payoutSetupWarning = '';
     if (requestedPayoutFields) {
-      if (!['pro', 'tipster', 'admin'].includes(req.user.role)) {
-        return res.status(403).json({ error: 'Solo usuarios Pro/Tipster/Admin pueden configurar pagos' });
-      }
       if (typeof bankAccountHolder === 'string') {
         updates.bankAccountHolder = normalizeTextField(bankAccountHolder, 80) || '';
       }
@@ -1136,12 +1399,74 @@ app.put('/api/auth/profile', auth, async (req, res) => {
         updates.bankName = normalizeTextField(bankName, 80) || '';
       }
       if (typeof clabe === 'string' && clabe.trim()) {
-        const setupPayload = await configureTipsterBankDestination(currentUser, {
-          clabe,
-          accountHolder: updates.bankAccountHolder || currentUser.bankAccountHolder || updates.name || currentUser.name,
-          bankName: updates.bankName || currentUser.bankName
-        });
-        Object.assign(updates, setupPayload);
+        const normalizedClabe = normalizeDigits(clabe);
+        if (!isValidClabe(normalizedClabe)) {
+          return res.status(400).json({ error: 'CLABE inválida' });
+        }
+        const accountHolder = updates.bankAccountHolder || currentUser.bankAccountHolder || updates.name || currentUser.name;
+        const normalizedBankName = updates.bankName || currentUser.bankName;
+        const saveLocalBankData = (status, warningText) => {
+          Object.assign(updates, {
+            bankClabeMasked: maskClabe(normalizedClabe),
+            bankClabeLast4: normalizedClabe.slice(-4),
+            bankAccountHolder: toSafeString(accountHolder),
+            bankName: toSafeString(normalizedBankName),
+            stripePayoutReady: false,
+            stripePayoutStatus: status
+          });
+          payoutSetupWarning = warningText;
+        };
+
+        const stripeAccountId = toSafeString(currentUser.stripeConnectedAccountId);
+        if (!stripeAccountId) {
+          saveLocalBankData(
+            'onboarding_required',
+            'Tus datos bancarios se guardaron localmente. Completa primero Stripe Connect desde tu perfil para habilitar transferencias automáticas.'
+          );
+        } else {
+          let connectSnapshot = null;
+          try {
+            connectSnapshot = await stripe.accounts.retrieve(stripeAccountId);
+          } catch (statusError) {
+            if (isStripeConnectUnavailableError(statusError)) {
+              saveLocalBankData(
+                'connect_not_enabled',
+                'Tus datos bancarios se guardaron, pero Stripe Connect no está habilitado aún. Actívalo en dashboard.stripe.com/connect para transferencias automáticas.'
+              );
+            } else {
+              saveLocalBankData(
+                'stripe_setup_pending',
+                'Tus datos bancarios se guardaron, pero no se pudo validar tu estado de Connect en este momento. Intenta nuevamente más tarde.'
+              );
+            }
+          }
+
+          if (connectSnapshot) {
+            const payoutState = resolveConnectAccountPayoutStatus(connectSnapshot);
+            if (!payoutState.payoutReady) {
+              saveLocalBankData(
+                'pending_verification',
+                'Tus datos bancarios se guardaron localmente. Completa/verifica tu onboarding de Stripe Connect y luego vuelve a guardar para vincular la cuenta bancaria.'
+              );
+            } else {
+              try {
+                const setupPayload = await configureTipsterBankDestination(currentUser, {
+                  clabe: normalizedClabe,
+                  accountHolder,
+                  bankName: normalizedBankName
+                });
+                Object.assign(updates, setupPayload);
+              } catch (stripeConnectError) {
+                const connectUnavailable = isStripeConnectUnavailableError(stripeConnectError);
+                const fallbackStatus = connectUnavailable ? 'connect_not_enabled' : 'stripe_setup_pending';
+                const fallbackWarning = connectUnavailable
+                  ? 'Tus datos bancarios se guardaron, pero Stripe Connect no está habilitado aún. Actívalo en dashboard.stripe.com/connect para transferencias automáticas.'
+                  : 'Tus datos bancarios se guardaron, pero Stripe no pudo completar la vinculación automáticamente en este momento. Intenta nuevamente más tarde.';
+                saveLocalBankData(fallbackStatus, fallbackWarning);
+              }
+            }
+          }
+        }
       }
     }
 
@@ -1153,7 +1478,9 @@ app.put('/api/auth/profile', auth, async (req, res) => {
     if (updates.name && currentUser?.name && currentUser.name !== updates.name) {
       await Pick.updateMany({ tipsterId: req.user.id }, { $set: { tipster: updates.name } });
     }
-    res.json(updated);
+    const payload = updated.toObject ? updated.toObject() : updated;
+    if (payoutSetupWarning) payload.setupWarning = payoutSetupWarning;
+    res.json(payload);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1162,7 +1489,26 @@ app.get('/api/picks', async (req, res) => {
   try {
     const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
     const picks = await Pick.find({ result: 'pending', createdAt: { $gte: sixHoursAgo } }).sort({ createdAt: -1 }).select('-ticketImg');
-    res.json(picks);
+    const pickIds = picks.map((pick) => pick?._id).filter(Boolean);
+    const salesByPickId = pickIds.length
+      ? await Purchase.aggregate([
+          { $match: { pickId: { $in: pickIds } } },
+          { $group: { _id: '$pickId', salesCount: { $sum: 1 } } }
+        ])
+      : [];
+    const salesMap = new Map(
+      salesByPickId.map((entry) => [String(entry?._id), Number(entry?.salesCount || 0)])
+    );
+    const payload = picks.map((pick) => {
+      const pickObject = pick.toObject ? pick.toObject() : pick;
+      const persistedSales = Number(pickObject?.salesCount || 0);
+      const derivedSales = Number(salesMap.get(String(pickObject?._id)) || 0);
+      return {
+        ...pickObject,
+        salesCount: Math.max(0, persistedSales, derivedSales)
+      };
+    });
+    res.json(payload);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1331,6 +1677,7 @@ app.get('/api/admin/revenue/weekly-payouts', auth, requireAdmin, async (req, res
 
 app.post('/api/admin/revenue/weekly-payouts/:id/approve', auth, requireAdmin, async (req, res) => {
   try {
+    if (!enforceLiveStripeMode(res)) return;
     const payoutId = req.params.id;
     const payout = await WeeklyTipsterPayout.findById(payoutId);
     if (!payout) return res.status(404).json({ error: 'Corte semanal no encontrado' });
@@ -1338,14 +1685,52 @@ app.post('/api/admin/revenue/weekly-payouts/:id/approve', auth, requireAdmin, as
     if (payout.status === 'processing') return res.status(400).json({ error: 'Este pago está en procesamiento' });
     if (Number(payout.payoutCents || 0) <= 0) return res.status(400).json({ error: 'Monto de payout inválido' });
 
-    const tipster = await User.findById(payout.tipsterId).select('name email bankClabeMasked bankAccountHolder bankName stripeConnectedAccountId stripePayoutReady');
+    const tipster = await User.findById(payout.tipsterId).select('name email bankClabeMasked bankClabeLast4 bankAccountHolder bankName stripeConnectedAccountId stripeExternalAccountId stripePayoutReady stripePayoutStatus');
     if (!tipster) return res.status(404).json({ error: 'Tipster no encontrado' });
-    if (!toSafeString(tipster.stripeConnectedAccountId)) {
+    const stripeConnectedAccountId = toSafeString(tipster.stripeConnectedAccountId);
+    if (!stripeConnectedAccountId) {
       return res.status(400).json({ error: 'El tipster no tiene cuenta Stripe Connect configurada' });
     }
-    if (!tipster.stripePayoutReady) {
+
+    let accountSnapshot = null;
+    try {
+      accountSnapshot = await stripe.accounts.retrieve(stripeConnectedAccountId);
+    } catch (connectError) {
+      const connectErrorMessage = toSafeString(connectError?.message || 'No se pudo validar la cuenta Connect del tipster');
+      return res.status(400).json({ error: connectErrorMessage || 'No se pudo validar la cuenta Connect del tipster' });
+    }
+
+    const externalAccounts = Array.isArray(accountSnapshot?.external_accounts?.data)
+      ? accountSnapshot.external_accounts.data
+      : [];
+    const externalBankAccount = externalAccounts.find((entry) => String(entry?.object || '').toLowerCase() === 'bank_account') || null;
+    const stripeExternalAccountId = toSafeString(tipster.stripeExternalAccountId) || toSafeString(externalBankAccount?.id);
+    const bankClabeLast4 = toSafeString(tipster.bankClabeLast4) || (toSafeString(tipster.bankClabeMasked).match(/(\d{4})$/)?.[1] || '') || toSafeString(externalBankAccount?.last4);
+    const bankClabeMasked = toSafeString(tipster.bankClabeMasked) || (bankClabeLast4 ? `**************${bankClabeLast4}` : '');
+    if (!stripeExternalAccountId || !bankClabeMasked || !bankClabeLast4) {
+      return res.status(400).json({ error: 'El tipster no tiene CLABE bancaria vinculada en Stripe Connect' });
+    }
+
+    const payoutState = resolveConnectAccountPayoutStatus(accountSnapshot);
+    if (!payoutState.payoutReady) {
       return res.status(400).json({ error: 'La cuenta Stripe del tipster aún no está lista para transferencias' });
     }
+
+    await User.findByIdAndUpdate(tipster._id, {
+      stripeConnectedAccountId,
+      stripeExternalAccountId,
+      bankClabeMasked,
+      bankClabeLast4,
+      stripePayoutReady: true,
+      stripePayoutStatus: 'configured'
+    });
+
+    tipster.stripeConnectedAccountId = stripeConnectedAccountId;
+    tipster.stripeExternalAccountId = stripeExternalAccountId;
+    tipster.bankClabeMasked = bankClabeMasked;
+    tipster.bankClabeLast4 = bankClabeLast4;
+    tipster.stripePayoutReady = true;
+    tipster.stripePayoutStatus = 'configured';
 
     await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
       status: 'processing',
@@ -1357,10 +1742,11 @@ app.post('/api/admin/revenue/weekly-payouts/:id/approve', auth, requireAdmin, as
       const transfer = await stripe.transfers.create({
         amount: Number(payout.payoutCents),
         currency: 'usd',
-        destination: tipster.stripeConnectedAccountId,
+        destination: stripeConnectedAccountId,
         metadata: {
           tpzPayoutId: String(payout._id),
           tpzTipsterId: String(tipster._id),
+          tpzBankClabeLast4: bankClabeLast4,
           weekStart: new Date(payout.weekStart).toISOString(),
           weekEnd: new Date(payout.weekEnd).toISOString()
         }
@@ -1386,7 +1772,10 @@ app.post('/api/admin/revenue/weekly-payouts/:id/approve', auth, requireAdmin, as
       res.json({
         success: true,
         payout: formatWeeklyPayoutEntry(refreshed, tipster),
-        stripeTransferId: transfer.id
+        stripeTransferId: transfer.id,
+        transferSource: 'stripe_balance',
+        destinationType: 'connect_external_bank_account',
+        destinationClabeLast4: bankClabeLast4
       });
     } catch (stripeError) {
       const errorMessage = toSafeString(stripeError?.message || 'No se pudo procesar el pago en Stripe').slice(0, 400);
@@ -2871,8 +3260,18 @@ const normalizeCheckoutSessionId = (value) => {
     return trimmed;
   }
 };
-
-const isValidCheckoutSessionId = (value) => /^cs_(test|live)_[^\s]+$/.test(value);
+const isValidCheckoutSessionId = (value) => {
+  if (typeof value !== 'string') return false;
+  if (STRIPE_LIVE_REQUIRED) return /^cs_live_[^\s]+$/.test(value);
+  return /^cs_(test|live)_[^\s]+$/.test(value);
+};
+const enforceLiveStripeMode = (res) => {
+  if (!STRIPE_LIVE_REQUIRED || STRIPE_MODE === 'live') return true;
+  res.status(503).json({
+    error: 'Stripe live requerido: el backend está configurado con credenciales de prueba (sk_test). Cambia a claves live para operar pagos y onboarding reales.'
+  });
+  return false;
+};
 const hasPickBuyerAccess = async (pickId, userId) => {
   if (!pickId || !userId) return false;
   const existingPurchase = await Purchase.exists({ pickId, buyerId: userId });
@@ -2898,6 +3297,7 @@ const getPickAccessState = async (pick, userId, userRole) => {
 
 app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => {
   try {
+    if (!enforceLiveStripeMode(res)) return;
     const { pickId } = req.body || {};
     if (!pickId) return res.status(400).json({ error: 'pickId requerido' });
     const pick = await Pick.findById(pickId);
@@ -2971,6 +3371,7 @@ app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => 
 
 app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) => {
   try {
+    if (!enforceLiveStripeMode(res)) return;
     const { sessionId, pickId } = req.body || {};
     const normalizedSessionId = normalizeCheckoutSessionId(sessionId);
     if (!normalizedSessionId) return res.status(400).json({ error: 'sessionId requerido' });
@@ -3002,7 +3403,7 @@ app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) =>
       return res.status(400).json({ error: 'pickId no coincide con la sesión de checkout' });
     }
 
-    await Purchase.findOneAndUpdate(
+    const purchaseUpsertResult = await Purchase.updateOne(
       { pickId: targetPickId, buyerId: req.user.id },
       {
         $set: {
@@ -3014,10 +3415,15 @@ app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) =>
       },
       { upsert: true }
     );
+    const isFirstPaidPurchase = Number(purchaseUpsertResult?.upsertedCount || 0) > 0;
+    const pickUpdatePayload = { $addToSet: { buyers: req.user.id } };
+    if (isFirstPaidPurchase) {
+      pickUpdatePayload.$inc = { salesCount: 1 };
+    }
 
     const updated = await Pick.findByIdAndUpdate(
       targetPickId,
-      { $addToSet: { buyers: req.user.id } },
+      pickUpdatePayload,
       { new: true }
     );
     if (!updated) return res.status(404).json({ error: 'Pick not found' });
@@ -3028,6 +3434,7 @@ app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) =>
 
 app.post('/api/stripe/pro/create-checkout-session', auth, async (req, res) => {
   try {
+    if (!enforceLiveStripeMode(res)) return;
     const urls = getUserBaseUrlFromRequest(req);
     if (!urls) return res.status(400).json({ error: 'URLs de retorno inválidas' });
 
@@ -3070,6 +3477,7 @@ app.post('/api/stripe/pro/create-checkout-session', auth, async (req, res) => {
 
 app.post('/api/stripe/pro/confirm-checkout-session', auth, async (req, res) => {
   try {
+    if (!enforceLiveStripeMode(res)) return;
     const { sessionId } = req.body || {};
     const normalizedSessionId = normalizeCheckoutSessionId(sessionId);
     if (!normalizedSessionId) return res.status(400).json({ error: 'sessionId requerido' });
@@ -3105,6 +3513,112 @@ app.post('/api/stripe/pro/confirm-checkout-session', auth, async (req, res) => {
 
     res.json({ success: true, user, proExpiry });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/stripe/connect/create-onboarding-link', auth, async (req, res) => {
+  try {
+    if (!enforceLiveStripeMode(res)) return;
+    const currentUser = await User.findById(req.user.id).select('email name stripeConnectedAccountId stripePayoutReady stripePayoutStatus');
+    if (!currentUser) return res.status(404).json({ error: 'User not found' });
+
+    const returnUrls = resolveConnectReturnUrls(req);
+    if (!returnUrls) return res.status(400).json({ error: 'refreshUrl/returnUrl inválidos o FRONTEND_BASE_URL no configurado' });
+
+    let stripeAccountId = toSafeString(currentUser.stripeConnectedAccountId);
+    if (!stripeAccountId) {
+      stripeAccountId = await ensureTipsterStripeAccount(currentUser);
+      await User.findByIdAndUpdate(currentUser._id, {
+        stripeConnectedAccountId: stripeAccountId,
+        stripePayoutReady: false,
+        stripePayoutStatus: 'onboarding_required'
+      });
+    }
+
+    const mode = String(req.body?.mode || '').trim().toLowerCase();
+    const linkType = mode === 'update' ? 'account_update' : 'account_onboarding';
+    const accountLink = await stripe.accountLinks.create({
+      account: stripeAccountId,
+      refresh_url: returnUrls.refreshUrl,
+      return_url: returnUrls.returnUrl,
+      type: linkType
+    });
+
+    res.json({
+      success: true,
+      stripeConnectedAccountId: stripeAccountId,
+      linkType,
+      onboardingUrl: accountLink?.url || ''
+    });
+  } catch (error) {
+    if (isStripeConnectUnavailableError(error)) {
+      return res.status(400).json({
+        error: 'Stripe Connect no está habilitado en esta cuenta de Stripe. Actívalo en dashboard.stripe.com/connect.'
+      });
+    }
+    res.status(500).json({ error: error.message || 'No se pudo crear el enlace de onboarding' });
+  }
+});
+
+app.get('/api/stripe/connect/status', auth, async (req, res) => {
+  try {
+    if (!enforceLiveStripeMode(res)) return;
+    const currentUser = await User.findById(req.user.id).select('stripeConnectedAccountId stripePayoutReady stripePayoutStatus stripeExternalAccountId bankClabeMasked bankClabeLast4');
+    if (!currentUser) return res.status(404).json({ error: 'User not found' });
+
+    const stripeAccountId = toSafeString(currentUser.stripeConnectedAccountId);
+    if (!stripeAccountId) {
+      const hasLocalClabe = Boolean(toSafeString(currentUser?.bankClabeMasked) || toSafeString(currentUser?.bankClabeLast4));
+      const fallbackStatus = hasLocalClabe ? 'onboarding_required' : 'not_configured';
+      await User.findByIdAndUpdate(currentUser._id, {
+        stripePayoutReady: false,
+        stripePayoutStatus: fallbackStatus
+      });
+      return res.json({
+        stripeConnectedAccountId: '',
+        hasConnectedAccount: false,
+        payoutsEnabled: false,
+        transfersCapability: 'inactive',
+        requirementsDue: 0,
+        stripePayoutReady: false,
+        stripePayoutStatus: fallbackStatus
+      });
+    }
+
+    const hydrated = await hydrateUserStripePayoutState(currentUser, { persist: true });
+    const accountSnapshot = await stripe.accounts.retrieve(stripeAccountId);
+    const payoutState = resolveConnectAccountPayoutStatus(accountSnapshot);
+    const transfersCapability = toSafeString(accountSnapshot?.capabilities?.transfers) || 'inactive';
+    const requirementsDue = Number(payoutState.requirementsDue || 0);
+
+    res.json({
+      stripeConnectedAccountId: stripeAccountId,
+      hasConnectedAccount: true,
+      payoutsEnabled: Boolean(accountSnapshot?.payouts_enabled),
+      transfersCapability,
+      requirementsDue,
+      stripeExternalAccountId: toSafeString(hydrated?.stripeExternalAccountId),
+      bankClabeMasked: toSafeString(hydrated?.bankClabeMasked),
+      bankClabeLast4: toSafeString(hydrated?.bankClabeLast4),
+      stripePayoutReady: Boolean(hydrated?.stripePayoutReady),
+      stripePayoutStatus: toSafeString(hydrated?.stripePayoutStatus) || (payoutState.payoutReady ? 'configured' : 'pending_verification')
+    });
+  } catch (error) {
+    if (isStripeConnectUnavailableError(error)) {
+      await User.findByIdAndUpdate(req.user.id, {
+        stripePayoutReady: false,
+        stripePayoutStatus: 'connect_not_enabled'
+      });
+      return res.json({
+        stripeConnectedAccountId: '',
+        hasConnectedAccount: false,
+        payoutsEnabled: false,
+        transfersCapability: 'inactive',
+        requirementsDue: 0,
+        stripePayoutReady: false,
+        stripePayoutStatus: 'connect_not_enabled'
+      });
+    }
+    res.status(500).json({ error: error.message || 'No se pudo consultar el estado de Connect' });
+  }
 });
 
 // ── PICKS FULL (with image) ───────────────────────────────────────────────────
