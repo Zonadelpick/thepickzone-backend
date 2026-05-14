@@ -80,6 +80,8 @@ const UserSchema = new mongoose.Schema({
   emailVerifiedAt: { type: Date },
   emailVerificationTokenHash: { type: String, default: '' },
   emailVerificationExpiresAt: { type: Date },
+  passwordResetTokenHash: { type: String, default: '' },
+  passwordResetExpiresAt: { type: Date },
   stripeConnectedAccountId: { type: String, default: '' },
   stripeExternalAccountId: { type: String, default: '' },
   stripePayoutReady: { type: Boolean, default: false },
@@ -148,6 +150,8 @@ const PickSchema = new mongoose.Schema({
   sportKey:   { type: String },
   sport:      { type: String },
   flag:       { type: String },
+  homeLogo:   { type: String, default: '' },
+  awayLogo:   { type: String, default: '' },
   match:      { type: String, required: true },
   time:       { type: String },
   odds:       { type: Number },
@@ -704,6 +708,15 @@ const buildEmailVerificationPayload = () => {
   const expiresAt = new Date(Date.now() + (24 * 60 * 60 * 1000));
   return { rawToken, tokenHash, expiresAt };
 };
+const buildPasswordResetPayload = () => {
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  const expiresAt = new Date(Date.now() + (60 * 60 * 1000));
+  return { rawToken, tokenHash, expiresAt };
+};
+const STRONG_PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{10,}$/;
+const isStrongPassword = (passwordValue) => STRONG_PASSWORD_REGEX.test(String(passwordValue || ''));
+const STRONG_PASSWORD_ERROR = 'La contraseña debe tener mínimo 10 caracteres e incluir mayúscula, minúscula, número y símbolo';
 
 const buildFrontendBaseUrl = () => {
   const value = String(process.env.FRONTEND_BASE_URL || process.env.FRONTEND_URL || process.env.APP_BASE_URL || '').trim();
@@ -738,6 +751,51 @@ const sendVerificationWelcomeEmail = async ({ toEmail, fullName, verificationLin
 
   if (!resendKey) {
     console.log(`[Auth] RESEND_API_KEY no configurada. Correo de verificación pendiente para ${toEmail}.`);
+    return { sent: false, reason: 'missing_resend_api_key' };
+  }
+
+  await axios.post(
+    'https://api.resend.com/emails',
+    {
+      from: fromEmail,
+      to: [toEmail],
+      subject,
+      html,
+      text
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${resendKey}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    }
+  );
+
+  return { sent: true };
+};
+const sendPasswordResetEmail = async ({ toEmail, fullName, resetLink }) => {
+  const resendKey = String(process.env.RESEND_API_KEY || '').trim();
+  const fromEmail = String(process.env.EMAIL_FROM || process.env.RESEND_FROM || 'The Pick Zone <noreply@thepickzone.mx>').trim();
+  const subject = 'The Pick Zone · Restablecer contraseña';
+  const html = `
+    <div style="font-family:Arial,sans-serif;color:#101114;line-height:1.6;">
+      <h2 style="margin-bottom:8px;">Restablecer contraseña</h2>
+      <p>Hola ${String(fullName || 'Tipster').replace(/[<>]/g, '')},</p>
+      <p>Recibimos una solicitud para restablecer tu contraseña. Puedes continuar desde el siguiente botón:</p>
+      <p style="margin:22px 0;">
+        <a href="${resetLink}" style="background:#1DB954;color:#000;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:6px;display:inline-block;">
+          Restablecer contraseña
+        </a>
+      </p>
+      <p>Si no solicitaste este cambio, ignora este correo.</p>
+      <p style="font-size:12px;color:#5e6770;">Este enlace vence en 1 hora.</p>
+    </div>
+  `;
+  const text = `Restablecer contraseña\n\nHola ${fullName || 'Tipster'},\nRecibimos una solicitud para restablecer tu contraseña. Usa este enlace:\n${resetLink}\n\nSi no solicitaste este cambio, ignora este correo.\n\nEste enlace vence en 1 hora.`;
+
+  if (!resendKey) {
+    console.log(`[Auth] RESEND_API_KEY no configurada. Correo de reset pendiente para ${toEmail}.`);
     return { sent: false, reason: 'missing_resend_api_key' };
   }
 
@@ -1211,8 +1269,8 @@ app.post('/api/auth/register', async (req, res) => {
     if (!isValidFunctionalEmail(normalizedEmail)) {
       return res.status(400).json({ error: 'Correo electrónico inválido' });
     }
-    if (String(password).length < 8) {
-      return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({ error: STRONG_PASSWORD_ERROR });
     }
     const exists = await User.findOne({ email: normalizedEmail });
     if (exists) return res.status(400).json({ error: 'Email ya registrado' });
@@ -1359,6 +1417,70 @@ app.post('/api/auth/resend-verification', async (req, res) => {
       emailSent: true,
       message: 'Correo de verificación reenviado. Revisa tu bandeja de entrada.'
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const normalizedEmail = String(req.body?.email || '').trim().toLowerCase();
+    const genericResponse = {
+      success: true,
+      message: 'Si el correo existe, enviaremos instrucciones para restablecer tu contraseña.'
+    };
+    if (!normalizedEmail || !isValidFunctionalEmail(normalizedEmail)) {
+      return res.json(genericResponse);
+    }
+
+    const user = await User.findOne({ email: normalizedEmail }).select('_id name email');
+    if (!user) return res.json(genericResponse);
+
+    const resetPayload = buildPasswordResetPayload();
+    await User.findByIdAndUpdate(user._id, {
+      passwordResetTokenHash: resetPayload.tokenHash,
+      passwordResetExpiresAt: resetPayload.expiresAt
+    });
+
+    const frontendBaseUrl = buildFrontendBaseUrl();
+    const resetLink = frontendBaseUrl
+      ? `${frontendBaseUrl}/?flow=reset-password&token=${encodeURIComponent(resetPayload.rawToken)}`
+      : `https://thepickzone.mx/?flow=reset-password&token=${encodeURIComponent(resetPayload.rawToken)}`;
+    try {
+      await sendPasswordResetEmail({
+        toEmail: normalizedEmail,
+        fullName: user.name,
+        resetLink
+      });
+    } catch (mailError) {
+      console.error('[Auth/ForgotPassword] sendPasswordResetEmail error:', mailError.message || mailError);
+    }
+
+    res.json(genericResponse);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const rawToken = String(req.body?.token || '').trim();
+    const newPassword = String(req.body?.password || '');
+    if (!rawToken || !newPassword) return res.status(400).json({ error: 'Token y contraseña son requeridos' });
+    if (!isStrongPassword(newPassword)) return res.status(400).json({ error: STRONG_PASSWORD_ERROR });
+
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const user = await User.findOne({
+      passwordResetTokenHash: tokenHash,
+      passwordResetExpiresAt: { $gt: new Date() }
+    }).select('_id');
+    if (!user) return res.status(400).json({ error: 'Token inválido o expirado' });
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await User.findByIdAndUpdate(user._id, {
+      password: hashedPassword,
+      passwordResetTokenHash: '',
+      passwordResetExpiresAt: null
+    });
+    res.json({ success: true, message: 'Contraseña actualizada correctamente. Ya puedes iniciar sesión.' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1574,8 +1696,7 @@ app.put('/api/auth/profile', auth, async (req, res) => {
 // ── PICKS ─────────────────────────────────────────────────────────────────────
 app.get('/api/picks', async (req, res) => {
   try {
-    const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
-    const picks = await Pick.find({ result: 'pending', createdAt: { $gte: sixHoursAgo } }).sort({ createdAt: -1 }).select('-ticketImg');
+    const picks = await Pick.find({ result: 'pending' }).sort({ createdAt: -1 }).select('-ticketImg');
     const pickIds = picks.map((pick) => pick?._id).filter(Boolean);
     const salesByPickId = pickIds.length
       ? await Purchase.aggregate([
@@ -1687,6 +1808,55 @@ const SPORT_KEYS = {
   'FA Cup': 'soccer_fa_cup', 'DFB Pokal': 'soccer_germany_dfb_pokal',
   'Coppa Italia': 'soccer_italy_coppa_italia', 'Coupe de France': 'soccer_france_coupe_de_france',
 };
+const TEAM_LOGO_CACHE_TTL_MS = 1000 * 60 * 60 * 12;
+const teamLogoCache = new Map();
+function buildTeamLogoCacheKey(teamName, sportKey = '') {
+  const normalizedName = String(teamName || '').trim().toLowerCase();
+  const normalizedSportKey = String(sportKey || '').trim().toLowerCase();
+  return `${normalizedSportKey}::${normalizedName}`;
+}
+function readTeamLogoCache(cacheKey) {
+  const hit = teamLogoCache.get(cacheKey);
+  if (!hit) return null;
+  if ((Date.now() - Number(hit.at || 0)) > TEAM_LOGO_CACHE_TTL_MS) {
+    teamLogoCache.delete(cacheKey);
+    return null;
+  }
+  return typeof hit.logo === 'string' ? hit.logo : '';
+}
+function writeTeamLogoCache(cacheKey, logoUrl) {
+  teamLogoCache.set(cacheKey, { logo: String(logoUrl || ''), at: Date.now() });
+}
+async function fetchTeamLogoByName(teamName) {
+  const cleanName = String(teamName || '').trim();
+  if (!cleanName) return '';
+  try {
+    const url = `https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=${encodeURIComponent(cleanName)}`;
+    const resp = await axios.get(url, { timeout: 9000 });
+    const teams = Array.isArray(resp?.data?.teams) ? resp.data.teams : [];
+    if (!teams.length) return '';
+    const exact = teams.find((row) => String(row?.strTeam || '').trim().toLowerCase() === cleanName.toLowerCase());
+    const candidate = exact || teams[0];
+    return String(candidate?.strBadge || candidate?.strTeamBadge || candidate?.strLogo || '').trim();
+  } catch {
+    return '';
+  }
+}
+async function resolveTeamLogo(teamName, sportKey = '') {
+  const cacheKey = buildTeamLogoCacheKey(teamName, sportKey);
+  const cached = readTeamLogoCache(cacheKey);
+  if (cached !== null) return cached;
+  const logo = await fetchTeamLogoByName(teamName);
+  writeTeamLogoCache(cacheKey, logo);
+  return logo;
+}
+async function resolveFixtureTeamLogos(homeTeam, awayTeam, sportKey = '') {
+  const [homeLogo, awayLogo] = await Promise.all([
+    resolveTeamLogo(homeTeam, sportKey),
+    resolveTeamLogo(awayTeam, sportKey)
+  ]);
+  return { homeLogo, awayLogo };
+}
 app.get('/api/fixtures/sports', async (req, res) => {
   try {
     const all = req.query.all === 'false' ? 'false' : 'true';
@@ -1713,16 +1883,21 @@ app.get('/api/fixtures/odds', async (req, res) => {
     if (!resolvedSportKey) return res.status(400).json({ error: 'sportKey o league requerido' });
     const url = `https://api.the-odds-api.com/v4/sports/${resolvedSportKey}/events?apiKey=${process.env.ODDS_API_KEY}&dateFormat=iso`;
     const resp = await axios.get(url);
-    const fixtures = (Array.isArray(resp.data) ? resp.data : [])
-      .filter((e) => e && e.home_team && e.away_team && e.commence_time)
-      .map(e => ({
+    const rawFixtures = (Array.isArray(resp.data) ? resp.data : [])
+      .filter((e) => e && e.home_team && e.away_team && e.commence_time);
+    const fixtures = await Promise.all(rawFixtures.map(async (e) => {
+      const logos = await resolveFixtureTeamLogos(e.home_team, e.away_team, resolvedSportKey);
+      return {
         id: e.id,
         home: e.home_team,
         away: e.away_team,
+        homeLogo: logos.homeLogo || '',
+        awayLogo: logos.awayLogo || '',
         time: e.commence_time,
         league: league || e.sport_title || resolvedSportKey,
         sportKey: resolvedSportKey
-      }));
+      };
+    }));
     res.json(fixtures);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -2191,6 +2366,12 @@ const PROP_STAT_ALIASES = {
   goals: ['goals', 'goal'],
   shots: ['shots', 'shot'],
   shots_on_target: ['shots_on_target', 'shots_on_goal', 'shots_on'],
+  corners: ['corners', 'corner', 'corner_kicks', 'kicks'],
+  yellow_cards: ['yellow_cards', 'yellow_card', 'tarjetas_amarillas', 'cards_yellow'],
+  red_cards: ['red_cards', 'red_card', 'tarjetas_rojas', 'cards_red'],
+  cards_total: ['cards_total', 'total_cards', 'tarjetas', 'cards'],
+  fouls: ['fouls', 'faltas', 'fauls'],
+  offsides: ['offsides', 'offside', 'fuera_de_juego'],
   saves: ['saves', 'save', 'goalkeeper_saves'],
   hits: ['hits', 'hit'],
   runs: ['runs', 'run'],
@@ -2201,6 +2382,14 @@ const PROP_STAT_ALIASES = {
   rushing_yards: ['rushing_yards', 'rush_yards'],
   receiving_yards: ['receiving_yards', 'rec_yards'],
   touchdowns: ['touchdowns', 'td']
+};
+const FOOTBALL_TEAM_PROP_STAT_TYPES = new Set(['corners', 'yellow_cards', 'red_cards', 'cards_total', 'fouls', 'offsides']);
+const FOOTBALL_TEAM_STAT_LABEL_ALIASES = {
+  corners: ['corner kicks', 'corners'],
+  yellow_cards: ['yellow cards'],
+  red_cards: ['red cards'],
+  fouls: ['fouls'],
+  offsides: ['offsides', 'offside']
 };
 
 function toSafeString(value) {
@@ -2635,7 +2824,7 @@ function resolveStandardMarket(bet, score) {
   };
 }
 
-async function resolveAiVerdictFallbackForStandardMarket({ pick, bet, score, baseResolution, ocrMeta }) {
+async function resolveAiVerdictFallbackForStandardMarket({ pick, bet, score, baseResolution, ocrMeta, oddsSignal = null }) {
   const base = baseResolution && typeof baseResolution === 'object' ? baseResolution : {};
   const baseOutcome = String(base.resultado || '').trim().toUpperCase();
   if (['GANADO', 'PERDIDO', 'VOID'].includes(baseOutcome)) return base;
@@ -2671,7 +2860,16 @@ Resultado oficial:
 - away: ${toSafeString(score?.away)}
 - homeScore: ${score?.homeScore ?? null}
 - awayScore: ${score?.awayScore ?? null}
-- completed: ${Boolean(score?.completed)}`;
+- completed: ${Boolean(score?.completed)}
+
+Señal de momios (odds):
+- available: ${Boolean(oddsSignal?.available)}
+- market: ${toSafeString(oddsSignal?.marketType)}
+- sampleSize: ${Number(oddsSignal?.sampleSize || 0)}
+- marketPrice: ${oddsSignal?.marketPrice ?? null}
+- ticketOdds: ${oddsSignal?.ticketOdds ?? null}
+- delta: ${oddsSignal?.ticketVsMarketDelta ?? null}
+- summary: ${toSafeString(oddsSignal?.summary)}`;
 
   try {
     const response = await anthropic.messages.create({
@@ -2734,7 +2932,7 @@ async function extractTicketBetWithVision(pick, currentBet) {
   "side":"home|away|over|under|yes|no|unknown",
   "line":numero_o_null,
   "playerName":"string_o_vacio",
-  "statType":"points|rebounds|assists|hits|runs|rbi|home_runs|strikeouts|passing_yards|rushing_yards|receiving_yards|touchdowns|goals|shots|shots_on_target|saves|unknown",
+  \"statType\":\"points|rebounds|assists|hits|runs|rbi|home_runs|strikeouts|passing_yards|rushing_yards|receiving_yards|touchdowns|goals|shots|shots_on_target|saves|corners|yellow_cards|red_cards|cards_total|fouls|offsides|unknown\",
   "bookmaker":"string_o_vacio",
   "homeTeam":"string_o_vacio",
   "awayTeam":"string_o_vacio",
@@ -2860,6 +3058,263 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
       commenceTime: toSafeString(bestMatch.commence_time),
       raw: bestMatch
     };
+  } catch {
+    return null;
+  }
+}
+
+const ODDS_EVENT_BOARD_CACHE_TTL_MS = 1000 * 60 * 4;
+const oddsEventBoardCache = new Map();
+
+function buildOddsEventBoardCacheKey(sportKey) {
+  return String(sportKey || '').trim().toLowerCase();
+}
+
+function readOddsEventBoardCache(cacheKey) {
+  const hit = oddsEventBoardCache.get(cacheKey);
+  if (!hit) return null;
+  if ((Date.now() - Number(hit.at || 0)) > ODDS_EVENT_BOARD_CACHE_TTL_MS) {
+    oddsEventBoardCache.delete(cacheKey);
+    return null;
+  }
+  return Array.isArray(hit.rows) ? hit.rows : [];
+}
+
+function writeOddsEventBoardCache(cacheKey, rows) {
+  oddsEventBoardCache.set(cacheKey, {
+    rows: Array.isArray(rows) ? rows : [],
+    at: Date.now()
+  });
+}
+
+function averageNumbers(values) {
+  const numeric = (Array.isArray(values) ? values : [])
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  if (!numeric.length) return null;
+  const total = numeric.reduce((acc, value) => acc + value, 0);
+  return Number((total / numeric.length).toFixed(3));
+}
+
+async function fetchOddsEventBoard(sportKey) {
+  const normalizedSportKey = toSafeString(sportKey);
+  if (!normalizedSportKey || !process.env.ODDS_API_KEY) return [];
+  const cacheKey = buildOddsEventBoardCacheKey(normalizedSportKey);
+  const cached = readOddsEventBoardCache(cacheKey);
+  if (cached) return cached;
+  try {
+    const url = `https://api.the-odds-api.com/v4/sports/${normalizedSportKey}/odds?apiKey=${process.env.ODDS_API_KEY}&regions=us&markets=h2h,spreads,totals&oddsFormat=decimal&dateFormat=iso`;
+    const resp = await axios.get(url, { timeout: 12000 });
+    const rows = Array.isArray(resp?.data) ? resp.data : [];
+    writeOddsEventBoardCache(cacheKey, rows);
+    return rows;
+  } catch {
+    return [];
+  }
+}
+
+function resolveOddsEventFromBoard(rows, { eventId, home, away }) {
+  const normalizedRows = Array.isArray(rows) ? rows : [];
+  const normalizedEventId = toSafeString(eventId);
+  if (normalizedEventId) {
+    const byId = normalizedRows.find((row) => String(row?.id || '') === normalizedEventId);
+    if (byId) return byId;
+  }
+  let bestMatch = null;
+  let bestScore = -1;
+  for (const row of normalizedRows) {
+    const candidateScore = scoreNameMatch(home, row?.home_team) + scoreNameMatch(away, row?.away_team);
+    if (candidateScore > bestScore) {
+      bestScore = candidateScore;
+      bestMatch = row;
+    }
+  }
+  return bestMatch;
+}
+
+function collectOutcomePricesFromEvent(row, marketKey, matcher) {
+  const prices = [];
+  const normalizedMarketKey = toSafeString(marketKey);
+  const bookmakers = Array.isArray(row?.bookmakers) ? row.bookmakers : [];
+  for (const bookmaker of bookmakers) {
+    const markets = Array.isArray(bookmaker?.markets) ? bookmaker.markets : [];
+    const market = markets.find((item) => toSafeString(item?.key) === normalizedMarketKey);
+    if (!market) continue;
+    const outcomes = Array.isArray(market.outcomes) ? market.outcomes : [];
+    for (const outcome of outcomes) {
+      const price = toSafeNumber(outcome?.price);
+      if (price === null || price <= 1) continue;
+      if (!matcher || matcher(outcome)) {
+        prices.push({ price, point: toSafeNumber(outcome?.point), name: toSafeString(outcome?.name) });
+      }
+    }
+  }
+  return prices;
+}
+
+function resolveOddsSignalForMarket({ pick, bet, score }) {
+  const marketType = normalizeMarketType(bet?.marketType, bet?.betType);
+  const ticketOdds = toSafeNumber(pick?.odds);
+  const signalBase = {
+    available: false,
+    marketType,
+    sampleSize: 0,
+    marketPrice: null,
+    ticketOdds: ticketOdds && ticketOdds > 1 ? Number(ticketOdds.toFixed(3)) : null,
+    ticketVsMarketDelta: null,
+    confidenceAdjustment: 0,
+    needsReview: false,
+    summary: '',
+    evidence: null
+  };
+  if (!score?.completed) {
+    signalBase.summary = 'Evento no finalizado para validar señal de momios.';
+    return signalBase;
+  }
+
+  let oddsMarketKey = '';
+  let selectionLabel = '';
+  let targetLine = null;
+  let matcher = null;
+
+  if (marketType === 'moneyline') {
+    let expectedSide = normalizeSide(bet?.side || bet?.selection);
+    if (!['home', 'away'].includes(expectedSide)) {
+      expectedSide = inferSideFromSelectionLabel(`${bet?.selectionLabel || ''} ${bet?.selection || ''}`, score.home, score.away);
+    }
+    if (!['home', 'away'].includes(expectedSide)) {
+      signalBase.summary = 'Moneyline sin lado identificable para cruzar momios.';
+      return signalBase;
+    }
+    oddsMarketKey = 'h2h';
+    selectionLabel = expectedSide === 'home' ? toSafeString(score?.home) : toSafeString(score?.away);
+    matcher = (outcome) => normalizeTeamName(outcome?.name) === normalizeTeamName(selectionLabel);
+  } else if (marketType === 'spread') {
+    const line = toSafeNumber(bet?.line);
+    let side = normalizeSide(bet?.side || bet?.selection);
+    if (!['home', 'away'].includes(side)) {
+      side = inferSideFromSelectionLabel(`${bet?.selectionLabel || ''} ${bet?.selection || ''}`, score.home, score.away);
+    }
+    if (line === null || !['home', 'away'].includes(side)) {
+      signalBase.summary = 'Spread incompleto para comparar contra momios.';
+      return signalBase;
+    }
+    oddsMarketKey = 'spreads';
+    targetLine = line;
+    selectionLabel = side === 'home' ? toSafeString(score?.home) : toSafeString(score?.away);
+    matcher = (outcome) => {
+      const point = toSafeNumber(outcome?.point);
+      return normalizeTeamName(outcome?.name) === normalizeTeamName(selectionLabel) && point !== null && Math.abs(point - line) <= 0.25;
+    };
+  } else if (marketType === 'total') {
+    const line = toSafeNumber(bet?.line);
+    const side = normalizeSide(bet?.side || bet?.selection);
+    if (line === null || !['over', 'under'].includes(side)) {
+      signalBase.summary = 'Total incompleto para comparar contra momios.';
+      return signalBase;
+    }
+    oddsMarketKey = 'totals';
+    targetLine = line;
+    selectionLabel = side;
+    matcher = (outcome) => {
+      const point = toSafeNumber(outcome?.point);
+      return normalizeSide(outcome?.name) === side && point !== null && Math.abs(point - line) <= 0.25;
+    };
+  } else {
+    signalBase.summary = `Mercado ${marketType || 'desconocido'} sin soporte de señal de momios.`;
+    return signalBase;
+  }
+
+  const prices = collectOutcomePricesFromEvent(score?.oddsEvent, oddsMarketKey, matcher);
+  const avgPrice = averageNumbers(prices.map((item) => item.price));
+  if (!avgPrice) {
+    signalBase.summary = 'No se encontraron momios equivalentes en mercado de cierre.';
+    return signalBase;
+  }
+
+  let confidenceAdjustment = prices.length >= 4 ? 1 : 0;
+  let delta = null;
+  let alignment = 'market_only';
+  if (signalBase.ticketOdds && signalBase.ticketOdds > 1) {
+    delta = Number(Math.abs(signalBase.ticketOdds - avgPrice).toFixed(3));
+    if (delta <= 0.2) {
+      alignment = 'strong';
+      confidenceAdjustment += 4;
+    } else if (delta <= 0.45) {
+      alignment = 'aligned';
+      confidenceAdjustment += 2;
+    } else if (delta <= 0.75) {
+      alignment = 'weak';
+      confidenceAdjustment -= 2;
+    } else {
+      alignment = 'mismatch';
+      confidenceAdjustment -= 8;
+    }
+  }
+  const impliedProbability = avgPrice > 1 ? Number((1 / avgPrice).toFixed(4)) : null;
+  const needsReview = alignment === 'mismatch';
+  const summary = `momio mercado ${avgPrice} (${prices.length} fuentes), ticket ${signalBase.ticketOdds ?? 'N/A'}, delta ${delta ?? 'N/A'}, alignment ${alignment}`;
+  return {
+    ...signalBase,
+    available: true,
+    marketType,
+    sampleSize: prices.length,
+    marketPrice: avgPrice,
+    ticketVsMarketDelta: delta,
+    confidenceAdjustment: Math.max(-12, Math.min(8, confidenceAdjustment)),
+    needsReview,
+    summary,
+    evidence: {
+      provider: 'odds-api',
+      type: 'market-odds-signal',
+      detail: summary,
+      value: {
+        marketType,
+        marketKey: oddsMarketKey,
+        selection: selectionLabel,
+        line: targetLine,
+        sampleSize: prices.length,
+        marketPrice: avgPrice,
+        impliedProbability,
+        ticketOdds: signalBase.ticketOdds,
+        ticketVsMarketDelta: delta,
+        alignment
+      }
+    }
+  };
+}
+
+function mergeOddsSignalIntoResolution(baseResolution, oddsSignal) {
+  const base = baseResolution && typeof baseResolution === 'object' ? baseResolution : {};
+  if (!oddsSignal || !oddsSignal.summary) return base;
+  const baseConfidence = clampNumber(base.confianza ?? 0, 0, 100, 0);
+  const adjustedConfidence = clampNumber(baseConfidence + Number(oddsSignal.confidenceAdjustment || 0), 0, 100, baseConfidence);
+  const detailPrefix = toSafeString(base.detalle || 'Sin detalle');
+  const mergedDetail = `${detailPrefix} | Señal odds: ${oddsSignal.summary}`.slice(0, 420);
+  return {
+    ...base,
+    confianza: adjustedConfidence,
+    needsReview: Boolean(base.needsReview || oddsSignal.needsReview),
+    detalle: mergedDetail,
+    evidence: [
+      ...(Array.isArray(base?.evidence) ? base.evidence : []),
+      ...(oddsSignal?.evidence ? [oddsSignal.evidence] : [])
+    ]
+  };
+}
+
+async function buildOddsSignalForStandardMarket({ pick, bet, score }) {
+  if (!score?.completed || !process.env.ODDS_API_KEY) return null;
+  try {
+    const oddsRows = await fetchOddsEventBoard(score?.sportKey || bet?.sportKey || pick?.sportKey);
+    const oddsEvent = resolveOddsEventFromBoard(oddsRows, {
+      eventId: score?.eventId || bet?.eventId,
+      home: score?.home || bet?.homeTeam,
+      away: score?.away || bet?.awayTeam
+    });
+    if (!oddsEvent) return null;
+    const scoreWithOdds = { ...score, oddsEvent };
+    return resolveOddsSignalForMarket({ pick, bet, score: scoreWithOdds });
   } catch {
     return null;
   }
@@ -3028,6 +3483,130 @@ function extractPlayerIds(payload) {
     .map((item) => String(item));
 }
 
+function parseApiSportsStatNumericValue(rawValue) {
+  if (rawValue === null || rawValue === undefined) return null;
+  if (typeof rawValue === 'number') return Number.isFinite(rawValue) ? rawValue : null;
+  const valueText = String(rawValue).trim();
+  if (!valueText) return null;
+  if (/^null$/i.test(valueText)) return null;
+  const cleaned = valueText.replace('%', '').replace(',', '.').replace(/[^\d.+-]/g, '');
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeFootballStatLabel(value) {
+  return normalizeToken(value)
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractFootballTeamStatsMap(payload) {
+  const rows = extractApiSportsRows(payload);
+  const map = new Map();
+  for (const row of rows) {
+    const teamName = toSafeString(row?.team?.name || row?.teamName || row?.team);
+    if (!teamName) continue;
+    const statRows = Array.isArray(row?.statistics) ? row.statistics : [];
+    const statMap = {};
+    for (const statRow of statRows) {
+      const statLabel = normalizeFootballStatLabel(statRow?.type);
+      if (!statLabel) continue;
+      const statValue = parseApiSportsStatNumericValue(statRow?.value);
+      if (statValue === null) continue;
+      statMap[statLabel] = statValue;
+    }
+    map.set(teamName, statMap);
+  }
+  return map;
+}
+
+function getFootballTeamStatValue(statMap, statType) {
+  if (!statMap || typeof statMap !== 'object') return null;
+  if (statType === 'cards_total') {
+    const yellow = getFootballTeamStatValue(statMap, 'yellow_cards');
+    const red = getFootballTeamStatValue(statMap, 'red_cards');
+    if (yellow === null && red === null) return null;
+    return Number((Number(yellow || 0) + Number(red || 0)).toFixed(3));
+  }
+  const aliases = FOOTBALL_TEAM_STAT_LABEL_ALIASES[statType] || [];
+  for (const alias of aliases) {
+    const normalizedAlias = normalizeFootballStatLabel(alias);
+    if (Object.prototype.hasOwnProperty.call(statMap, normalizedAlias)) {
+      return toSafeNumber(statMap[normalizedAlias]);
+    }
+  }
+  return null;
+}
+
+function findTeamStatsByName(teamStatsMap, teamName) {
+  const normalizedTarget = normalizeTeamName(teamName);
+  let bestEntry = null;
+  let bestScore = -1;
+  for (const [candidateName, stats] of teamStatsMap.entries()) {
+    const candidateScore = scoreNameMatch(normalizedTarget, candidateName);
+    if (candidateScore > bestScore) {
+      bestScore = candidateScore;
+      bestEntry = { teamName: candidateName, stats };
+    }
+  }
+  if (!bestEntry || bestScore <= 0) return null;
+  return bestEntry;
+}
+
+async function fetchApiSportsFootballTeamPropValue({ eventId, statType, homeTeam, awayTeam, selectionLabel, side, providerTrace }) {
+  const payload = await apiSportsGet('football', '/fixtures/statistics', { fixture: eventId }, providerTrace);
+  const teamStatsMap = extractFootballTeamStatsMap(payload);
+  if (!teamStatsMap.size) {
+    return { ok: false, message: 'Sin estadísticas de equipos para el fixture.' };
+  }
+
+  const resolvedHome = findTeamStatsByName(teamStatsMap, homeTeam);
+  const resolvedAway = findTeamStatsByName(teamStatsMap, awayTeam);
+  const homeValue = resolvedHome ? getFootballTeamStatValue(resolvedHome.stats, statType) : null;
+  const awayValue = resolvedAway ? getFootballTeamStatValue(resolvedAway.stats, statType) : null;
+  const totalValue = (homeValue !== null || awayValue !== null)
+    ? Number((Number(homeValue || 0) + Number(awayValue || 0)).toFixed(3))
+    : null;
+
+  const selectionHint = normalizeTeamName(selectionLabel);
+  let scope = 'match';
+  let selectedTeam = null;
+  let statValue = totalValue;
+  if (side === 'home' && homeValue !== null) {
+    scope = 'team';
+    selectedTeam = resolvedHome?.teamName || homeTeam;
+    statValue = homeValue;
+  } else if (side === 'away' && awayValue !== null) {
+    scope = 'team';
+    selectedTeam = resolvedAway?.teamName || awayTeam;
+    statValue = awayValue;
+  } else if (selectionHint) {
+    if (resolvedHome && normalizeTeamName(resolvedHome.teamName) === selectionHint && homeValue !== null) {
+      scope = 'team';
+      selectedTeam = resolvedHome.teamName;
+      statValue = homeValue;
+    } else if (resolvedAway && normalizeTeamName(resolvedAway.teamName) === selectionHint && awayValue !== null) {
+      scope = 'team';
+      selectedTeam = resolvedAway.teamName;
+      statValue = awayValue;
+    }
+  }
+
+  if (statValue === null) {
+    return { ok: false, message: `No se encontró stat ${statType} en fixture.` };
+  }
+  return {
+    ok: true,
+    statValue,
+    scope,
+    selectedTeam: selectedTeam || '',
+    homeValue,
+    awayValue,
+    totalValue
+  };
+}
+
 async function fetchApiSportsPropValue({ sportCode, eventId, playerName, statType, providerTrace }) {
   let payload = null;
   if (sportCode === 'football') {
@@ -3101,23 +3680,47 @@ async function resolvePropMarket(pick, bet) {
   const line = toSafeNumber(bet?.line);
   const playerName = toSafeString(bet?.playerName);
   const statType = normalizeStatType(bet?.statType || bet?.marketKey || bet?.marketType);
-  if (!playerName || !statType || line === null || !['over', 'under'].includes(side)) {
+  const isFootballTeamProp = sportCode === 'football' && FOOTBALL_TEAM_PROP_STAT_TYPES.has(statType);
+  if (!statType || line === null || !['over', 'under'].includes(side)) {
     return {
       resultado: 'NECESITA_VERIFICACION',
       confianza: 32,
-      detalle: 'Prop incompleto: se requiere jugador, statType, línea y over/under.',
+      detalle: 'Prop incompleto: se requiere statType, línea y over/under.',
       needsReview: true,
       evidence: [],
       providerTrace
     };
   }
-  const statResult = await fetchApiSportsPropValue({
-    sportCode,
-    eventId: eventLookup.eventId,
-    playerName,
-    statType,
-    providerTrace
-  });
+  if (!isFootballTeamProp && !playerName) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 32,
+      detalle: 'Prop incompleto: se requiere jugador para este tipo de mercado.',
+      needsReview: true,
+      evidence: [],
+      providerTrace
+    };
+  }
+  let statResult;
+  if (isFootballTeamProp) {
+    statResult = await fetchApiSportsFootballTeamPropValue({
+      eventId: eventLookup.eventId,
+      statType,
+      homeTeam,
+      awayTeam,
+      selectionLabel: bet?.selectionLabel || bet?.selection || '',
+      side,
+      providerTrace
+    });
+  } else {
+    statResult = await fetchApiSportsPropValue({
+      sportCode,
+      eventId: eventLookup.eventId,
+      playerName,
+      statType,
+      providerTrace
+    });
+  }
   if (!statResult.ok) {
     return {
       resultado: 'NECESITA_VERIFICACION',
@@ -3130,24 +3733,70 @@ async function resolvePropMarket(pick, bet) {
   }
   const statValue = statResult.statValue;
   if (statValue === line) {
+    const detailLabel = isFootballTeamProp
+      ? `${statType}: ${statValue} (${statResult.scope === 'team' ? (statResult.selectedTeam || 'equipo') : 'partido'})`
+      : `${statType}: ${statValue}`;
     return {
       resultado: 'VOID',
       confianza: 84,
-      detalle: `${statResult.playerName} terminó con ${statValue}, exacto a la línea ${line}.`,
+      detalle: isFootballTeamProp
+        ? `Prop soccer exacto: ${detailLabel} = línea ${line}.`
+        : `${statResult.playerName} terminó con ${statValue}, exacto a la línea ${line}.`,
       needsReview: false,
-      evidence: [{ provider: 'api-sports', type: 'player-prop', detail: `${statType}: ${statValue}`, value: { statType, statValue, line, side, player: statResult.playerName } }],
+      evidence: [{
+        provider: 'api-sports',
+        type: isFootballTeamProp ? 'team-prop' : 'player-prop',
+        detail: detailLabel,
+        value: isFootballTeamProp
+          ? {
+              statType,
+              statValue,
+              line,
+              side,
+              scope: statResult.scope,
+              selectedTeam: statResult.selectedTeam || null,
+              homeValue: statResult.homeValue ?? null,
+              awayValue: statResult.awayValue ?? null,
+              totalValue: statResult.totalValue ?? null
+            }
+          : { statType, statValue, line, side, player: statResult.playerName }
+      }],
       providerTrace
     };
   }
   const won = (side === 'over' && statValue > line) || (side === 'under' && statValue < line);
+  const detailLabel = isFootballTeamProp
+    ? `${statType}: ${statValue} (${statResult.scope === 'team' ? (statResult.selectedTeam || 'equipo') : 'partido'})`
+    : `${statType}: ${statValue}`;
   return {
     resultado: won ? 'GANADO' : 'PERDIDO',
     confianza: 86,
-    detalle: won
-      ? `${statResult.playerName} ${side} ${line} (${statType}: ${statValue})`
-      : `${statResult.playerName} no cumplió ${side} ${line} (${statType}: ${statValue})`,
+    detalle: isFootballTeamProp
+      ? (won
+          ? `Soccer prop ${side} ${line} cumplido (${detailLabel}).`
+          : `Soccer prop ${side} ${line} fallado (${detailLabel}).`)
+      : (won
+          ? `${statResult.playerName} ${side} ${line} (${statType}: ${statValue})`
+          : `${statResult.playerName} no cumplió ${side} ${line} (${statType}: ${statValue})`),
     needsReview: false,
-    evidence: [{ provider: 'api-sports', type: 'player-prop', detail: `${statType}: ${statValue}`, value: { statType, statValue, line, side, player: statResult.playerName } }],
+    evidence: [{
+      provider: 'api-sports',
+      type: isFootballTeamProp ? 'team-prop' : 'player-prop',
+      detail: detailLabel,
+      value: isFootballTeamProp
+        ? {
+            statType,
+            statValue,
+            line,
+            side,
+            scope: statResult.scope,
+            selectedTeam: statResult.selectedTeam || null,
+            homeValue: statResult.homeValue ?? null,
+            awayValue: statResult.awayValue ?? null,
+            totalValue: statResult.totalValue ?? null
+          }
+        : { statType, statValue, line, side, player: statResult.playerName }
+    }],
     providerTrace
   };
 }
@@ -3180,12 +3829,19 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
       mergedBet.eventId
     );
     resolution = resolveStandardMarket(mergedBet, score);
+    const oddsSignal = await buildOddsSignalForStandardMarket({
+      pick,
+      bet: mergedBet,
+      score
+    });
+    resolution = mergeOddsSignalIntoResolution(resolution, oddsSignal);
     resolution = await resolveAiVerdictFallbackForStandardMarket({
       pick,
       bet: mergedBet,
       score,
       baseResolution: resolution,
-      ocrMeta
+      ocrMeta,
+      oddsSignal
     });
   }
   const aiAnalysis = {
