@@ -50,6 +50,11 @@ const UserSchema = new mongoose.Schema({
   bio:        { type: String },
   username:   { type: String },
   roi:        { type: String, default: '+0%' },
+  yield:      { type: String, default: '+0%' },
+  roiValue:   { type: Number, default: 0 },
+  yieldValue: { type: Number, default: 0 },
+  netUnits:   { type: Number, default: 0 },
+  totalRiskedUnits: { type: Number, default: 0 },
   winRate:    { type: Number, default: 0 },
   totalPicks: { type: Number, default: 0 },
   wonPicks:   { type: Number, default: 0 },
@@ -224,11 +229,17 @@ const calculateTipsterStatsFromPicks = (resolvedPicks) => {
 
   const decisivePicks = wonPicks + lostPicks;
   const winRate = decisivePicks > 0 ? Math.round((wonPicks / decisivePicks) * 100) : 0;
-  const roiValue = totalRiskedUnits > 0 ? ((totalProfitUnits / totalRiskedUnits) * 100) : 0;
+  const roiValue = totalProfitUnits;
+  const yieldValue = totalRiskedUnits > 0 ? ((totalProfitUnits / totalRiskedUnits) * 100) : 0;
   const avgOdds = oddsCount > 0 ? Number((oddsAccumulator / oddsCount).toFixed(2)) : 0;
 
   return {
     roi: formatRoiPercent(Number(roiValue.toFixed(1))),
+    yield: formatRoiPercent(Number(yieldValue.toFixed(1))),
+    roiValue: Number(roiValue.toFixed(2)),
+    yieldValue: Number(yieldValue.toFixed(2)),
+    netUnits: Number(totalProfitUnits.toFixed(2)),
+    totalRiskedUnits: Number(totalRiskedUnits.toFixed(2)),
     winRate,
     totalPicks: wonPicks + lostPicks + pushPicks,
     wonPicks,
@@ -1039,6 +1050,11 @@ app.post('/api/auth/login', async (req, res) => {
         avatar: user.avatar,
         bio: user.bio,
         roi: user.roi,
+        yield: user.yield,
+        roiValue: user.roiValue,
+        yieldValue: user.yieldValue,
+        netUnits: user.netUnits,
+        totalRiskedUnits: user.totalRiskedUnits,
         winRate: user.winRate,
         totalPicks: user.totalPicks,
         wonPicks: user.wonPicks,
@@ -1575,7 +1591,21 @@ app.post('/api/admin/picks/bulk-analyze', auth, requireAdmin, async (req, res) =
 
 app.post('/api/admin/reset-stats', auth, requireAdmin, async (req, res) => {
   try {
-    await User.updateMany({}, { roi: '+0%', winRate: 0, totalPicks: 0, wonPicks: 0, lostPicks: 0, pushPicks: 0, avgOdds: 0, balance: 0 });
+    await User.updateMany({}, {
+      roi: '+0%',
+      yield: '+0%',
+      roiValue: 0,
+      yieldValue: 0,
+      netUnits: 0,
+      totalRiskedUnits: 0,
+      winRate: 0,
+      totalPicks: 0,
+      wonPicks: 0,
+      lostPicks: 0,
+      pushPicks: 0,
+      avgOdds: 0,
+      balance: 0
+    });
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1598,7 +1628,21 @@ app.post('/api/admin/clean-db', async (req, res) => {
     const keepEmails = ['admin@thepickzone.com','75_solos_cierne@icloud.com','fernando.martinez10@hotmail.com'];
     const deleted = await User.deleteMany({ email: { $nin: keepEmails } });
     const picksDeleted = await Pick.deleteMany({});
-    await User.updateMany({}, { roi: '+0%', winRate: 0, totalPicks: 0, wonPicks: 0, lostPicks: 0, pushPicks: 0, avgOdds: 0, balance: 0 });
+    await User.updateMany({}, {
+      roi: '+0%',
+      yield: '+0%',
+      roiValue: 0,
+      yieldValue: 0,
+      netUnits: 0,
+      totalRiskedUnits: 0,
+      winRate: 0,
+      totalPicks: 0,
+      wonPicks: 0,
+      lostPicks: 0,
+      pushPicks: 0,
+      avgOdds: 0,
+      balance: 0
+    });
     res.json({ success: true, usersDeleted: deleted.deletedCount, picksDeleted: picksDeleted.deletedCount });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
