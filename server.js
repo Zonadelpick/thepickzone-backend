@@ -15,6 +15,12 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({ error: 'JSON inválido en el body de la solicitud' });
+  }
+  return next(err);
+});
 
 const resolveStripeSecretKey = () => {
   const direct = (process.env.STRIPE_SECRET_KEY || '').trim();
@@ -775,8 +781,8 @@ const sendVerificationWelcomeEmail = async ({ toEmail, fullName, verificationLin
   const text = `¡Bienvenido a The Pick Zone!\n\nHola ${fullName || 'Tipster'},\nGracias por registrarte. Para activar tu cuenta y validar tu correo, usa este enlace:\n${verificationLink}\n\nSi no solicitaste este registro, ignora este mensaje.\n\nEste enlace vence en 24 horas.`;
 
   if (!resendKey) {
-    console.log(`[Auth] RESEND_API_KEY no configurada. Correo de verificación pendiente para ${toEmail}.`);
-    return { sent: false, reason: 'missing_resend_api_key' };
+    console.log(`[Auth] Resend API key no configurada (usa RESEND_API_KEY, RESEND_API_TOKEN o RESEND_KEY). Correo de verificación pendiente para ${toEmail}.`);
+    return { sent: false, reason: 'missing_resend_api_key', acceptedKeyEnvVars: ['RESEND_API_KEY', 'RESEND_API_TOKEN', 'RESEND_KEY'] };
   }
 
   await axios.post(
@@ -820,8 +826,8 @@ const sendPasswordResetEmail = async ({ toEmail, fullName, resetLink }) => {
   const text = `Restablecer contraseña\n\nHola ${fullName || 'Tipster'},\nRecibimos una solicitud para restablecer tu contraseña. Usa este enlace:\n${resetLink}\n\nSi no solicitaste este cambio, ignora este correo.\n\nEste enlace vence en 1 hora.`;
 
   if (!resendKey) {
-    console.log(`[Auth] RESEND_API_KEY no configurada. Correo de reset pendiente para ${toEmail}.`);
-    return { sent: false, reason: 'missing_resend_api_key' };
+    console.log(`[Auth] Resend API key no configurada (usa RESEND_API_KEY, RESEND_API_TOKEN o RESEND_KEY). Correo de reset pendiente para ${toEmail}.`);
+    return { sent: false, reason: 'missing_resend_api_key', acceptedKeyEnvVars: ['RESEND_API_KEY', 'RESEND_API_TOKEN', 'RESEND_KEY'] };
   }
 
   await axios.post(
