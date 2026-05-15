@@ -728,30 +728,77 @@ const buildFrontendBaseUrl = () => {
   const value = String(process.env.FRONTEND_BASE_URL || process.env.FRONTEND_URL || process.env.APP_BASE_URL || '').trim();
   return value.replace(/\/+$/, '');
 };
-const resolveResendApiKey = () => {
+const RESEND_KEY_ENV_VARS = ['RESEND_API_KEY', 'RESEND_API_TOKEN', 'RESEND_KEY'];
+const RESEND_FROM_ENV_VARS = ['EMAIL_FROM', 'RESEND_FROM', 'RESEND_FROM_EMAIL', 'RESEND_SENDER'];
+const DEFAULT_RESEND_FROM = 'The Pick Zone <noreply@thepickzone.mx>';
+const extractSenderEmail = (senderValue) => {
+  const sender = String(senderValue || '').trim();
+  if (!sender) return '';
+  const bracketMatch = sender.match(/<([^>]+)>/);
+  if (bracketMatch && bracketMatch[1]) return String(bracketMatch[1]).trim().toLowerCase();
+  return sender.toLowerCase();
+};
+const isLikelyValidSender = (senderValue) => {
+  const email = extractSenderEmail(senderValue);
+  if (!email) return false;
+  return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/i.test(email);
+};
+const resolveResendApiKeyWithSource = () => {
   const candidates = [
-    process.env.RESEND_API_KEY,
-    process.env.RESEND_API_TOKEN,
-    process.env.RESEND_KEY
+    { name: 'RESEND_API_KEY', value: process.env.RESEND_API_KEY },
+    { name: 'RESEND_API_TOKEN', value: process.env.RESEND_API_TOKEN },
+    { name: 'RESEND_KEY', value: process.env.RESEND_KEY }
   ];
   for (const candidate of candidates) {
-    const normalized = String(candidate || '').trim();
-    if (normalized) return normalized;
+    const normalized = String(candidate?.value || '').trim();
+    if (normalized) return { value: normalized, source: candidate.name };
   }
-  return '';
+  return { value: '', source: '' };
+};
+const resolveResendApiKey = () => {
+  return resolveResendApiKeyWithSource().value;
+};
+const resolveResendFromEmailWithSource = () => {
+  const candidates = [
+    { name: 'EMAIL_FROM', value: process.env.EMAIL_FROM },
+    { name: 'RESEND_FROM', value: process.env.RESEND_FROM },
+    { name: 'RESEND_FROM_EMAIL', value: process.env.RESEND_FROM_EMAIL },
+    { name: 'RESEND_SENDER', value: process.env.RESEND_SENDER }
+  ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate?.value || '').trim();
+    if (normalized) return { value: normalized, source: candidate.name, isDefault: false };
+  }
+  return { value: DEFAULT_RESEND_FROM, source: 'default', isDefault: true };
 };
 const resolveResendFromEmail = () => {
-  const candidates = [
-    process.env.EMAIL_FROM,
-    process.env.RESEND_FROM,
-    process.env.RESEND_FROM_EMAIL,
-    process.env.RESEND_SENDER
-  ];
-  for (const candidate of candidates) {
-    const normalized = String(candidate || '').trim();
-    if (normalized) return normalized;
+  return resolveResendFromEmailWithSource().value;
+};
+const buildEmailProviderDiagnostics = () => {
+  const keyConfig = resolveResendApiKeyWithSource();
+  const fromConfig = resolveResendFromEmailWithSource();
+  return {
+    hasResendApiKey: Boolean(keyConfig.value),
+    resendApiKeySource: keyConfig.source || null,
+    fromAddress: fromConfig.value,
+    fromSource: fromConfig.source,
+    usingDefaultFrom: Boolean(fromConfig.isDefault),
+    fromLooksValid: isLikelyValidSender(fromConfig.value)
+  };
+};
+const logEmailProviderStartupDiagnostics = () => {
+  const diagnostics = buildEmailProviderDiagnostics();
+  if (!diagnostics.hasResendApiKey) {
+    console.warn(`[Auth/EmailConfig] Missing Resend API key. Define one of: ${RESEND_KEY_ENV_VARS.join(', ')}`);
+  } else {
+    console.log(`[Auth/EmailConfig] Resend API key loaded from ${diagnostics.resendApiKeySource}`);
   }
-  return 'The Pick Zone <noreply@thepickzone.mx>';
+  if (diagnostics.usingDefaultFrom) {
+    console.warn(`[Auth/EmailConfig] Using default sender "${diagnostics.fromAddress}". Configure one of: ${RESEND_FROM_ENV_VARS.join(', ')}`);
+  }
+  if (!diagnostics.fromLooksValid) {
+    console.warn(`[Auth/EmailConfig] Sender format may be invalid: "${diagnostics.fromAddress}"`);
+  }
 };
 const resolveEmailVerificationRequired = () => {
   const explicit = String(process.env.AUTH_REQUIRE_EMAIL_VERIFICATION || '').trim().toLowerCase();
@@ -759,10 +806,13 @@ const resolveEmailVerificationRequired = () => {
   if (explicit === 'false') return false;
   return Boolean(resolveResendApiKey());
 };
+logEmailProviderStartupDiagnostics();
 
 const sendVerificationWelcomeEmail = async ({ toEmail, fullName, verificationLink }) => {
-  const resendKey = resolveResendApiKey();
-  const fromEmail = resolveResendFromEmail();
+  const resendConfig = resolveResendApiKeyWithSource();
+  const fromConfig = resolveResendFromEmailWithSource();
+  const resendKey = resendConfig.value;
+  const fromEmail = fromConfig.value;
   const subject = 'Bienvenido a The Pick Zone · Verifica tu correo';
   const html = `
     <div style="font-family:Arial,sans-serif;color:#101114;line-height:1.6;">
@@ -781,8 +831,13 @@ const sendVerificationWelcomeEmail = async ({ toEmail, fullName, verificationLin
   const text = `¡Bienvenido a The Pick Zone!\n\nHola ${fullName || 'Tipster'},\nGracias por registrarte. Para activar tu cuenta y validar tu correo, usa este enlace:\n${verificationLink}\n\nSi no solicitaste este registro, ignora este mensaje.\n\nEste enlace vence en 24 horas.`;
 
   if (!resendKey) {
-    console.log(`[Auth] Resend API key no configurada (usa RESEND_API_KEY, RESEND_API_TOKEN o RESEND_KEY). Correo de verificación pendiente para ${toEmail}.`);
-    return { sent: false, reason: 'missing_resend_api_key', acceptedKeyEnvVars: ['RESEND_API_KEY', 'RESEND_API_TOKEN', 'RESEND_KEY'] };
+    console.warn(`[Auth] Resend API key no configurada (usa ${RESEND_KEY_ENV_VARS.join(', ')}). Correo de verificación pendiente para ${toEmail}.`);
+    return {
+      sent: false,
+      reason: 'missing_resend_api_key',
+      acceptedKeyEnvVars: RESEND_KEY_ENV_VARS,
+      acceptedFromEnvVars: RESEND_FROM_ENV_VARS
+    };
   }
 
   await axios.post(
@@ -806,8 +861,10 @@ const sendVerificationWelcomeEmail = async ({ toEmail, fullName, verificationLin
   return { sent: true };
 };
 const sendPasswordResetEmail = async ({ toEmail, fullName, resetLink }) => {
-  const resendKey = resolveResendApiKey();
-  const fromEmail = resolveResendFromEmail();
+  const resendConfig = resolveResendApiKeyWithSource();
+  const fromConfig = resolveResendFromEmailWithSource();
+  const resendKey = resendConfig.value;
+  const fromEmail = fromConfig.value;
   const subject = 'The Pick Zone · Restablecer contraseña';
   const html = `
     <div style="font-family:Arial,sans-serif;color:#101114;line-height:1.6;">
@@ -826,8 +883,13 @@ const sendPasswordResetEmail = async ({ toEmail, fullName, resetLink }) => {
   const text = `Restablecer contraseña\n\nHola ${fullName || 'Tipster'},\nRecibimos una solicitud para restablecer tu contraseña. Usa este enlace:\n${resetLink}\n\nSi no solicitaste este cambio, ignora este correo.\n\nEste enlace vence en 1 hora.`;
 
   if (!resendKey) {
-    console.log(`[Auth] Resend API key no configurada (usa RESEND_API_KEY, RESEND_API_TOKEN o RESEND_KEY). Correo de reset pendiente para ${toEmail}.`);
-    return { sent: false, reason: 'missing_resend_api_key', acceptedKeyEnvVars: ['RESEND_API_KEY', 'RESEND_API_TOKEN', 'RESEND_KEY'] };
+    console.warn(`[Auth] Resend API key no configurada (usa ${RESEND_KEY_ENV_VARS.join(', ')}). Correo de reset pendiente para ${toEmail}.`);
+    return {
+      sent: false,
+      reason: 'missing_resend_api_key',
+      acceptedKeyEnvVars: RESEND_KEY_ENV_VARS,
+      acceptedFromEnvVars: RESEND_FROM_ENV_VARS
+    };
   }
 
   await axios.post(
