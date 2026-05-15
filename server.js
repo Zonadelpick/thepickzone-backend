@@ -730,7 +730,7 @@ const buildFrontendBaseUrl = () => {
 };
 const RESEND_KEY_ENV_VARS = ['RESEND_API_KEY', 'RESEND_API_TOKEN', 'RESEND_KEY'];
 const RESEND_FROM_ENV_VARS = ['EMAIL_FROM', 'RESEND_FROM', 'RESEND_FROM_EMAIL', 'RESEND_SENDER'];
-const DEFAULT_RESEND_FROM = 'The Pick Zone <noreply@thepickzone.mx>';
+const DEFAULT_RESEND_FROM = 'The Pick Zone <noreply@tpz.mx>';
 const extractSenderEmail = (senderValue) => {
   const sender = String(senderValue || '').trim();
   if (!sender) return '';
@@ -1386,7 +1386,7 @@ app.post('/api/auth/register', async (req, res) => {
     const frontendBaseUrl = buildFrontendBaseUrl();
     const verificationLink = frontendBaseUrl
       ? `${frontendBaseUrl}/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`
-      : `https://thepickzone.mx/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`;
+      : `https://tpz.mx/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`;
     let emailDelivery = { sent: false, reason: 'verification_not_required' };
     if (emailVerificationRequired) {
       emailDelivery = { sent: false, reason: 'missing_config' };
@@ -1484,7 +1484,7 @@ app.post('/api/auth/resend-verification', async (req, res) => {
     const frontendBaseUrl = buildFrontendBaseUrl();
     const verificationLink = frontendBaseUrl
       ? `${frontendBaseUrl}/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`
-      : `https://thepickzone.mx/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`;
+      : `https://tpz.mx/?flow=verify-email&token=${encodeURIComponent(verificationPayload.rawToken)}`;
     let emailDelivery = { sent: false, reason: 'missing_config' };
     try {
       emailDelivery = await sendVerificationWelcomeEmail({
@@ -1537,7 +1537,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const frontendBaseUrl = buildFrontendBaseUrl();
     const resetLink = frontendBaseUrl
       ? `${frontendBaseUrl}/?flow=reset-password&token=${encodeURIComponent(resetPayload.rawToken)}`
-      : `https://thepickzone.mx/?flow=reset-password&token=${encodeURIComponent(resetPayload.rawToken)}`;
+      : `https://tpz.mx/?flow=reset-password&token=${encodeURIComponent(resetPayload.rawToken)}`;
     try {
       await sendPasswordResetEmail({
         toEmail: normalizedEmail,
