@@ -1218,6 +1218,114 @@ async function buildWeeklyPayoutSummary(weekOffset = 0) {
     payouts: formattedPayouts
   };
 }
+const DEFAULT_WEEKLY_PAYOUT_MIN_CENTS = Number.isFinite(Number(process.env.WEEKLY_PAYOUT_MIN_CENTS))
+  ? Math.max(0, Math.floor(Number(process.env.WEEKLY_PAYOUT_MIN_CENTS)))
+  : 2000;
+const DEFAULT_WEEKLY_PAYOUT_RUN_LIMIT = Number.isFinite(Number(process.env.WEEKLY_PAYOUT_RUN_LIMIT))
+  ? Math.max(1, Math.min(500, Math.floor(Number(process.env.WEEKLY_PAYOUT_RUN_LIMIT))))
+  : 150;
+const buildHttpError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
+async function processWeeklyPayoutById({ payoutId, approvedByUserId }) {
+  const payout = await WeeklyTipsterPayout.findById(payoutId);
+  if (!payout) throw buildHttpError(404, 'Corte semanal no encontrado');
+  if (payout.status === 'paid') throw buildHttpError(400, 'Este pago ya fue procesado');
+  if (payout.status === 'processing') throw buildHttpError(400, 'Este pago está en procesamiento');
+  if (Number(payout.payoutCents || 0) <= 0) throw buildHttpError(400, 'Monto de payout inválido');
+  const tipster = await User.findById(payout.tipsterId).select('name email bankClabeMasked bankClabeLast4 bankAccountHolder bankName stripeConnectedAccountId stripeExternalAccountId stripePayoutReady stripePayoutStatus');
+  if (!tipster) throw buildHttpError(404, 'Tipster no encontrado');
+  const stripeConnectedAccountId = toSafeString(tipster.stripeConnectedAccountId);
+  if (!stripeConnectedAccountId) {
+    throw buildHttpError(400, 'El tipster no tiene cuenta Stripe Connect configurada');
+  }
+  let accountSnapshot = null;
+  try {
+    accountSnapshot = await stripe.accounts.retrieve(stripeConnectedAccountId);
+  } catch (connectError) {
+    const connectErrorMessage = toSafeString(connectError?.message || 'No se pudo validar la cuenta Connect del tipster');
+    throw buildHttpError(400, connectErrorMessage || 'No se pudo validar la cuenta Connect del tipster');
+  }
+  const externalAccounts = Array.isArray(accountSnapshot?.external_accounts?.data)
+    ? accountSnapshot.external_accounts.data
+    : [];
+  const externalBankAccount = externalAccounts.find((entry) => String(entry?.object || '').toLowerCase() === 'bank_account') || null;
+  const stripeExternalAccountId = toSafeString(tipster.stripeExternalAccountId) || toSafeString(externalBankAccount?.id);
+  const bankClabeLast4 = toSafeString(tipster.bankClabeLast4) || (toSafeString(tipster.bankClabeMasked).match(/(\d{4})$/)?.[1] || '') || toSafeString(externalBankAccount?.last4);
+  const bankClabeMasked = toSafeString(tipster.bankClabeMasked) || (bankClabeLast4 ? `**************${bankClabeLast4}` : '');
+  if (!stripeExternalAccountId || !bankClabeMasked || !bankClabeLast4) {
+    throw buildHttpError(400, 'El tipster no tiene CLABE bancaria vinculada en Stripe Connect');
+  }
+  const payoutState = resolveConnectAccountPayoutStatus(accountSnapshot);
+  if (!payoutState.payoutReady) {
+    throw buildHttpError(400, 'La cuenta Stripe del tipster aún no está lista para transferencias');
+  }
+  await User.findByIdAndUpdate(tipster._id, {
+    stripeConnectedAccountId,
+    stripeExternalAccountId,
+    bankClabeMasked,
+    bankClabeLast4,
+    stripePayoutReady: true,
+    stripePayoutStatus: 'configured'
+  });
+  tipster.stripeConnectedAccountId = stripeConnectedAccountId;
+  tipster.stripeExternalAccountId = stripeExternalAccountId;
+  tipster.bankClabeMasked = bankClabeMasked;
+  tipster.bankClabeLast4 = bankClabeLast4;
+  tipster.stripePayoutReady = true;
+  tipster.stripePayoutStatus = 'configured';
+  await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
+    status: 'processing',
+    errorMessage: '',
+    updatedAt: new Date()
+  });
+  try {
+    const transfer = await stripe.transfers.create({
+      amount: Number(payout.payoutCents),
+      currency: 'usd',
+      destination: stripeConnectedAccountId,
+      metadata: {
+        tpzPayoutId: String(payout._id),
+        tpzTipsterId: String(tipster._id),
+        tpzBankClabeLast4: bankClabeLast4,
+        weekStart: new Date(payout.weekStart).toISOString(),
+        weekEnd: new Date(payout.weekEnd).toISOString()
+      }
+    });
+    await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
+      status: 'paid',
+      stripeTransferId: transfer.id,
+      approvedBy: approvedByUserId || null,
+      approvedAt: new Date(),
+      errorMessage: '',
+      updatedAt: new Date()
+    });
+    await User.findByIdAndUpdate(tipster._id, {
+      stripeLastTransferId: transfer.id,
+      stripeLastPayoutAt: new Date(),
+      stripePayoutStatus: 'configured',
+      stripePayoutReady: true
+    });
+    const refreshed = await WeeklyTipsterPayout.findById(payout._id);
+    return {
+      payout: formatWeeklyPayoutEntry(refreshed, tipster),
+      stripeTransferId: transfer.id,
+      transferSource: 'stripe_balance',
+      destinationType: 'connect_external_bank_account',
+      destinationClabeLast4: bankClabeLast4
+    };
+  } catch (stripeError) {
+    const errorMessage = toSafeString(stripeError?.message || 'No se pudo procesar el pago en Stripe').slice(0, 400);
+    await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
+      status: 'failed',
+      errorMessage,
+      updatedAt: new Date()
+    });
+    throw buildHttpError(400, errorMessage || 'No se pudo procesar el pago en Stripe');
+  }
+}
 
 function normalizeWindowDays(value, fallback = 30) {
   const parsed = Number(value);
@@ -1450,6 +1558,59 @@ app.get('/api/auth/verify-email', async (req, res) => {
     user.emailVerificationExpiresAt = null;
     await user.save();
     res.json({ success: true, message: 'Correo verificado correctamente. Ya puedes iniciar sesión.' });
+  } catch (e) {
+    const statusCode = Number(e?.statusCode || 500);
+    res.status(statusCode).json({ error: e.message });
+  }
+});
+app.post('/api/payouts/run-weekly', auth, requireAdmin, async (req, res) => {
+  try {
+    if (!enforceLiveStripeMode(res)) return;
+    const weekOffsetRaw = Number(req.body?.weekOffset ?? req.query.weekOffset ?? 0);
+    const weekOffset = Number.isFinite(weekOffsetRaw) ? Math.max(-52, Math.min(52, Math.floor(weekOffsetRaw))) : 0;
+    const minPayoutRaw = Number(req.body?.minPayoutCents ?? req.query.minPayoutCents ?? DEFAULT_WEEKLY_PAYOUT_MIN_CENTS);
+    const minPayoutCents = Number.isFinite(minPayoutRaw) ? Math.max(0, Math.floor(minPayoutRaw)) : DEFAULT_WEEKLY_PAYOUT_MIN_CENTS;
+    const limitRaw = Number(req.body?.limit ?? req.query.limit ?? DEFAULT_WEEKLY_PAYOUT_RUN_LIMIT);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.floor(limitRaw))) : DEFAULT_WEEKLY_PAYOUT_RUN_LIMIT;
+    const includeFailedRetries = String(req.body?.includeFailedRetries ?? req.query.includeFailedRetries ?? 'false').toLowerCase() === 'true';
+    await buildWeeklyPayoutSummary(weekOffset);
+    const { weekStart, weekEnd } = resolveWeekRange(weekOffset);
+    const eligibleStatuses = includeFailedRetries ? ['pending', 'failed'] : ['pending'];
+    const candidates = await WeeklyTipsterPayout.find({
+      weekStart,
+      weekEnd,
+      status: { $in: eligibleStatuses },
+      payoutCents: { $gte: minPayoutCents }
+    })
+      .sort({ payoutCents: -1, createdAt: 1 })
+      .limit(limit);
+    const summary = {
+      success: true,
+      filters: { weekOffset, minPayoutCents, limit, includeFailedRetries },
+      totals: { considered: candidates.length, paid: 0, failed: 0 },
+      payouts: []
+    };
+    for (const payout of candidates) {
+      try {
+        const result = await processWeeklyPayoutById({ payoutId: payout._id, approvedByUserId: req.user.id });
+        summary.totals.paid += 1;
+        summary.payouts.push({
+          payoutId: String(payout._id),
+          tipsterId: String(payout.tipsterId || ''),
+          status: 'paid',
+          stripeTransferId: result.stripeTransferId
+        });
+      } catch (error) {
+        summary.totals.failed += 1;
+        summary.payouts.push({
+          payoutId: String(payout._id),
+          tipsterId: String(payout.tipsterId || ''),
+          status: 'failed',
+          error: toSafeString(error?.message || 'payout_failed')
+        });
+      }
+    }
+    res.json(summary);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -2082,116 +2243,11 @@ app.get('/api/admin/revenue/weekly-payouts', auth, requireAdmin, async (req, res
 app.post('/api/admin/revenue/weekly-payouts/:id/approve', auth, requireAdmin, async (req, res) => {
   try {
     if (!enforceLiveStripeMode(res)) return;
-    const payoutId = req.params.id;
-    const payout = await WeeklyTipsterPayout.findById(payoutId);
-    if (!payout) return res.status(404).json({ error: 'Corte semanal no encontrado' });
-    if (payout.status === 'paid') return res.status(400).json({ error: 'Este pago ya fue procesado' });
-    if (payout.status === 'processing') return res.status(400).json({ error: 'Este pago está en procesamiento' });
-    if (Number(payout.payoutCents || 0) <= 0) return res.status(400).json({ error: 'Monto de payout inválido' });
-
-    const tipster = await User.findById(payout.tipsterId).select('name email bankClabeMasked bankClabeLast4 bankAccountHolder bankName stripeConnectedAccountId stripeExternalAccountId stripePayoutReady stripePayoutStatus');
-    if (!tipster) return res.status(404).json({ error: 'Tipster no encontrado' });
-    const stripeConnectedAccountId = toSafeString(tipster.stripeConnectedAccountId);
-    if (!stripeConnectedAccountId) {
-      return res.status(400).json({ error: 'El tipster no tiene cuenta Stripe Connect configurada' });
-    }
-
-    let accountSnapshot = null;
-    try {
-      accountSnapshot = await stripe.accounts.retrieve(stripeConnectedAccountId);
-    } catch (connectError) {
-      const connectErrorMessage = toSafeString(connectError?.message || 'No se pudo validar la cuenta Connect del tipster');
-      return res.status(400).json({ error: connectErrorMessage || 'No se pudo validar la cuenta Connect del tipster' });
-    }
-
-    const externalAccounts = Array.isArray(accountSnapshot?.external_accounts?.data)
-      ? accountSnapshot.external_accounts.data
-      : [];
-    const externalBankAccount = externalAccounts.find((entry) => String(entry?.object || '').toLowerCase() === 'bank_account') || null;
-    const stripeExternalAccountId = toSafeString(tipster.stripeExternalAccountId) || toSafeString(externalBankAccount?.id);
-    const bankClabeLast4 = toSafeString(tipster.bankClabeLast4) || (toSafeString(tipster.bankClabeMasked).match(/(\d{4})$/)?.[1] || '') || toSafeString(externalBankAccount?.last4);
-    const bankClabeMasked = toSafeString(tipster.bankClabeMasked) || (bankClabeLast4 ? `**************${bankClabeLast4}` : '');
-    if (!stripeExternalAccountId || !bankClabeMasked || !bankClabeLast4) {
-      return res.status(400).json({ error: 'El tipster no tiene CLABE bancaria vinculada en Stripe Connect' });
-    }
-
-    const payoutState = resolveConnectAccountPayoutStatus(accountSnapshot);
-    if (!payoutState.payoutReady) {
-      return res.status(400).json({ error: 'La cuenta Stripe del tipster aún no está lista para transferencias' });
-    }
-
-    await User.findByIdAndUpdate(tipster._id, {
-      stripeConnectedAccountId,
-      stripeExternalAccountId,
-      bankClabeMasked,
-      bankClabeLast4,
-      stripePayoutReady: true,
-      stripePayoutStatus: 'configured'
-    });
-
-    tipster.stripeConnectedAccountId = stripeConnectedAccountId;
-    tipster.stripeExternalAccountId = stripeExternalAccountId;
-    tipster.bankClabeMasked = bankClabeMasked;
-    tipster.bankClabeLast4 = bankClabeLast4;
-    tipster.stripePayoutReady = true;
-    tipster.stripePayoutStatus = 'configured';
-
-    await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
-      status: 'processing',
-      errorMessage: '',
-      updatedAt: new Date()
-    });
-
-    try {
-      const transfer = await stripe.transfers.create({
-        amount: Number(payout.payoutCents),
-        currency: 'usd',
-        destination: stripeConnectedAccountId,
-        metadata: {
-          tpzPayoutId: String(payout._id),
-          tpzTipsterId: String(tipster._id),
-          tpzBankClabeLast4: bankClabeLast4,
-          weekStart: new Date(payout.weekStart).toISOString(),
-          weekEnd: new Date(payout.weekEnd).toISOString()
-        }
-      });
-
-      await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
-        status: 'paid',
-        stripeTransferId: transfer.id,
-        approvedBy: req.user.id,
-        approvedAt: new Date(),
-        errorMessage: '',
-        updatedAt: new Date()
-      });
-
-      await User.findByIdAndUpdate(tipster._id, {
-        stripeLastTransferId: transfer.id,
-        stripeLastPayoutAt: new Date(),
-        stripePayoutStatus: 'configured',
-        stripePayoutReady: true
-      });
-
-      const refreshed = await WeeklyTipsterPayout.findById(payout._id);
-      res.json({
-        success: true,
-        payout: formatWeeklyPayoutEntry(refreshed, tipster),
-        stripeTransferId: transfer.id,
-        transferSource: 'stripe_balance',
-        destinationType: 'connect_external_bank_account',
-        destinationClabeLast4: bankClabeLast4
-      });
-    } catch (stripeError) {
-      const errorMessage = toSafeString(stripeError?.message || 'No se pudo procesar el pago en Stripe').slice(0, 400);
-      await WeeklyTipsterPayout.findByIdAndUpdate(payout._id, {
-        status: 'failed',
-        errorMessage,
-        updatedAt: new Date()
-      });
-      res.status(400).json({ error: errorMessage || 'No se pudo procesar el pago en Stripe' });
-    }
+    const result = await processWeeklyPayoutById({ payoutId: req.params.id, approvedByUserId: req.user.id });
+    res.json({ success: true, ...result });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    const statusCode = Number(e?.statusCode || 500);
+    res.status(statusCode).json({ error: e.message });
   }
 });
 
