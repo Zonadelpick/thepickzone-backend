@@ -722,16 +722,41 @@ const buildFrontendBaseUrl = () => {
   const value = String(process.env.FRONTEND_BASE_URL || process.env.FRONTEND_URL || process.env.APP_BASE_URL || '').trim();
   return value.replace(/\/+$/, '');
 };
+const resolveResendApiKey = () => {
+  const candidates = [
+    process.env.RESEND_API_KEY,
+    process.env.RESEND_API_TOKEN,
+    process.env.RESEND_KEY
+  ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || '').trim();
+    if (normalized) return normalized;
+  }
+  return '';
+};
+const resolveResendFromEmail = () => {
+  const candidates = [
+    process.env.EMAIL_FROM,
+    process.env.RESEND_FROM,
+    process.env.RESEND_FROM_EMAIL,
+    process.env.RESEND_SENDER
+  ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || '').trim();
+    if (normalized) return normalized;
+  }
+  return 'The Pick Zone <noreply@thepickzone.mx>';
+};
 const resolveEmailVerificationRequired = () => {
   const explicit = String(process.env.AUTH_REQUIRE_EMAIL_VERIFICATION || '').trim().toLowerCase();
   if (explicit === 'true') return true;
   if (explicit === 'false') return false;
-  return Boolean(String(process.env.RESEND_API_KEY || '').trim());
+  return Boolean(resolveResendApiKey());
 };
 
 const sendVerificationWelcomeEmail = async ({ toEmail, fullName, verificationLink }) => {
-  const resendKey = String(process.env.RESEND_API_KEY || '').trim();
-  const fromEmail = String(process.env.EMAIL_FROM || process.env.RESEND_FROM || 'The Pick Zone <noreply@thepickzone.mx>').trim();
+  const resendKey = resolveResendApiKey();
+  const fromEmail = resolveResendFromEmail();
   const subject = 'Bienvenido a The Pick Zone · Verifica tu correo';
   const html = `
     <div style="font-family:Arial,sans-serif;color:#101114;line-height:1.6;">
@@ -775,8 +800,8 @@ const sendVerificationWelcomeEmail = async ({ toEmail, fullName, verificationLin
   return { sent: true };
 };
 const sendPasswordResetEmail = async ({ toEmail, fullName, resetLink }) => {
-  const resendKey = String(process.env.RESEND_API_KEY || '').trim();
-  const fromEmail = String(process.env.EMAIL_FROM || process.env.RESEND_FROM || 'The Pick Zone <noreply@thepickzone.mx>').trim();
+  const resendKey = resolveResendApiKey();
+  const fromEmail = resolveResendFromEmail();
   const subject = 'The Pick Zone · Restablecer contraseña';
   const html = `
     <div style="font-family:Arial,sans-serif;color:#101114;line-height:1.6;">
@@ -1452,7 +1477,9 @@ app.post('/api/auth/forgot-password', async (req, res) => {
         resetLink
       });
     } catch (mailError) {
-      console.error('[Auth/ForgotPassword] sendPasswordResetEmail error:', mailError.message || mailError);
+      const resendErrorBody = mailError?.response?.data || null;
+      const resendErrorStatus = mailError?.response?.status || null;
+      console.error('[Auth/ForgotPassword] sendPasswordResetEmail error:', mailError.message || mailError, resendErrorStatus ? `status=${resendErrorStatus}` : '', resendErrorBody ? `body=${JSON.stringify(resendErrorBody)}` : '');
     }
 
     res.json(genericResponse);
