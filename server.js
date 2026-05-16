@@ -1975,6 +1975,105 @@ app.get('/api/picks', async (req, res) => {
     res.json(payload);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+app.get('/share/pick/:id/og-image.svg', async (req, res) => {
+  try {
+    const pickId = String(req.params?.id || '').trim();
+    if (!pickId || !mongoose.Types.ObjectId.isValid(pickId)) return res.status(404).send('not_found');
+    const pick = await Pick.findById(pickId).select('match league sport tipster odds price homeLogo awayLogo');
+    if (!pick) return res.status(404).send('not_found');
+    const match = String(pick?.match || 'Pick deportivo').trim();
+    const teams = parseMatchTeams(match);
+    const homeTeam = teams.homeTeam || 'Home';
+    const awayTeam = teams.awayTeam || 'Away';
+    const homeLogo = String(pick?.homeLogo || '').trim();
+    const awayLogo = String(pick?.awayLogo || '').trim();
+    const oddsText = formatShareOdds(pick?.odds);
+    const priceText = formatShareUsdAmount(pick?.price);
+    const tipsterText = String(pick?.tipster || 'Tipster').trim();
+    const leagueText = String(pick?.league || pick?.sport || 'The Pick Zone').trim();
+    const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0f0e"/>
+      <stop offset="100%" stop-color="#122019"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="40" y="40" width="1120" height="550" rx="28" fill="#111815" stroke="#1e2d24" stroke-width="3"/>
+  <text x="80" y="110" fill="#1DB954" font-size="40" font-family="Arial, sans-serif" font-weight="700">THE PICK ZONE</text>
+  <text x="80" y="175" fill="#E8F0EC" font-size="48" font-family="Arial, sans-serif" font-weight="700">${escapeXml(homeTeam)} vs ${escapeXml(awayTeam)}</text>
+  <text x="80" y="225" fill="#92A89F" font-size="30" font-family="Arial, sans-serif">${escapeXml(leagueText)}</text>
+  <text x="80" y="295" fill="#E8F0EC" font-size="34" font-family="Arial, sans-serif">Tipster: ${escapeXml(tipsterText)}</text>
+  <rect x="80" y="340" width="310" height="100" rx="18" fill="#0f1410" stroke="#1DB954" stroke-width="2"/>
+  <text x="105" y="388" fill="#92A89F" font-size="26" font-family="Arial, sans-serif">Momio</text>
+  <text x="105" y="426" fill="#E8F0EC" font-size="42" font-family="Arial, sans-serif" font-weight="700">${escapeXml(oddsText)}</text>
+  <rect x="420" y="340" width="310" height="100" rx="18" fill="#0f1410" stroke="#1DB954" stroke-width="2"/>
+  <text x="445" y="388" fill="#92A89F" font-size="26" font-family="Arial, sans-serif">Costo</text>
+  <text x="445" y="426" fill="#E8F0EC" font-size="42" font-family="Arial, sans-serif" font-weight="700">${escapeXml(priceText)}</text>
+  ${homeLogo ? `<rect x="860" y="170" width="120" height="120" rx="60" fill="#0f1410" stroke="#1e2d24" stroke-width="2"/><image href="${escapeXml(homeLogo)}" x="870" y="180" width="100" height="100" preserveAspectRatio="xMidYMid meet"/>` : ''}
+  ${awayLogo ? `<rect x="1010" y="170" width="120" height="120" rx="60" fill="#0f1410" stroke="#1e2d24" stroke-width="2"/><image href="${escapeXml(awayLogo)}" x="1020" y="180" width="100" height="100" preserveAspectRatio="xMidYMid meet"/>` : ''}
+  <text x="80" y="530" fill="#6B8078" font-size="24" font-family="Arial, sans-serif">Comparte este pick en WhatsApp y redes sociales</text>
+</svg>`;
+    res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=600');
+    return res.status(200).send(svg);
+  } catch {
+    return res.status(500).send('error');
+  }
+});
+app.get('/share/pick/:id', async (req, res) => {
+  try {
+    const pickId = String(req.params?.id || '').trim();
+    if (!pickId || !mongoose.Types.ObjectId.isValid(pickId)) return res.status(404).send('not_found');
+    const pick = await Pick.findById(pickId).select('match league sport tipster odds price');
+    if (!pick) return res.status(404).send('not_found');
+    const frontendBase = (buildFrontendBaseUrl() || 'https://tpz.mx').replace(/\/+$/, '');
+    const destinationUrl = `${frontendBase}/?flow=pick&pickId=${encodeURIComponent(String(pick._id))}`;
+    const requestOrigin = resolveRequestOrigin(req);
+    const imageUrl = requestOrigin
+      ? `${requestOrigin}/share/pick/${encodeURIComponent(String(pick._id))}/og-image.svg`
+      : `${frontendBase}/logo192.png`;
+    const matchText = String(pick?.match || 'Pick deportivo').trim();
+    const tipsterText = String(pick?.tipster || 'Tipster').trim();
+    const oddsText = formatShareOdds(pick?.odds);
+    const priceText = formatShareUsdAmount(pick?.price);
+    const leagueText = String(pick?.league || pick?.sport || 'The Pick Zone').trim();
+    const ogTitle = `${matchText} · Momio ${oddsText} · ${priceText}`;
+    const ogDescription = `Pick de ${tipsterText} en ${leagueText}. Costo ${priceText}.`;
+    const html = `<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(ogTitle)}</title>
+  <meta name="description" content="${escapeHtml(ogDescription)}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="The Pick Zone" />
+  <meta property="og:title" content="${escapeHtml(ogTitle)}" />
+  <meta property="og:description" content="${escapeHtml(ogDescription)}" />
+  <meta property="og:image" content="${escapeHtml(imageUrl)}" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:url" content="${escapeHtml(destinationUrl)}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${escapeHtml(ogTitle)}" />
+  <meta name="twitter:description" content="${escapeHtml(ogDescription)}" />
+  <meta name="twitter:image" content="${escapeHtml(imageUrl)}" />
+  <meta http-equiv="refresh" content="0; url=${escapeHtml(destinationUrl)}" />
+</head>
+<body>
+  <script>window.location.replace(${JSON.stringify(destinationUrl)});</script>
+  <p>Redirigiendo a <a href="${escapeHtml(destinationUrl)}">The Pick Zone</a>...</p>
+</body>
+</html>`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    return res.status(200).send(html);
+  } catch {
+    return res.status(500).send('error');
+  }
+});
 
 app.post('/api/picks', auth, async (req, res) => {
   try {
@@ -2201,6 +2300,47 @@ async function resolveFixtureTeamLogos(homeTeam, awayTeam, sportKey = '') {
     resolveTeamLogo(awayTeam, sportKey)
   ]);
   return { homeLogo, awayLogo };
+}
+function parseMatchTeams(matchValue) {
+  const rawMatch = String(matchValue || '').trim();
+  if (!rawMatch) return { homeTeam: '', awayTeam: '' };
+  const splitters = [/\s+vs\.?\s+/i, /\s+v\s+/i, /\s+-\s+/];
+  for (const splitter of splitters) {
+    const parts = rawMatch.split(splitter).map((part) => String(part || '').trim()).filter(Boolean);
+    if (parts.length >= 2) return { homeTeam: parts[0], awayTeam: parts[1] };
+  }
+  return { homeTeam: rawMatch, awayTeam: '' };
+}
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+function escapeXml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+function resolveRequestOrigin(req) {
+  const protocolHeader = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const protocol = protocolHeader || req.protocol || 'https';
+  const host = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
+  return host ? `${protocol}://${host}` : '';
+}
+function formatShareUsdAmount(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return '$0.00';
+  return `$${amount.toFixed(2)}`;
+}
+function formatShareOdds(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed.toFixed(2) : '--';
 }
 app.get('/api/fixtures/sports', async (req, res) => {
   try {
