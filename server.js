@@ -2066,6 +2066,22 @@ const SPORT_KEYS = {
 };
 const TEAM_LOGO_CACHE_TTL_MS = 1000 * 60 * 60 * 12;
 const teamLogoCache = new Map();
+const espnTeamsDirectoryCache = new Map();
+const ESPN_TEAM_DIRECTORY_TTL_MS = 1000 * 60 * 60 * 6;
+const ESPN_LEAGUE_PATH_BY_SPORT_KEY = {
+  basketball_nba: 'basketball/nba',
+  basketball_wnba: 'basketball/wnba',
+  baseball_mlb: 'baseball/mlb',
+  americanfootball_nfl: 'football/nfl',
+  icehockey_nhl: 'hockey/nhl',
+  soccer_epl: 'soccer/eng.1',
+  soccer_usa_mls: 'soccer/usa.1',
+  soccer_mexico_ligamx: 'soccer/mex.1',
+  soccer_spain_la_liga: 'soccer/esp.1',
+  soccer_germany_bundesliga: 'soccer/ger.1',
+  soccer_italy_serie_a: 'soccer/ita.1',
+  soccer_france_ligue_one: 'soccer/fra.1'
+};
 function buildTeamLogoCacheKey(teamName, sportKey = '') {
   const normalizedName = String(teamName || '').trim().toLowerCase();
   const normalizedSportKey = String(sportKey || '').trim().toLowerCase();
@@ -2083,17 +2099,90 @@ function readTeamLogoCache(cacheKey) {
 function writeTeamLogoCache(cacheKey, logoUrl) {
   teamLogoCache.set(cacheKey, { logo: String(logoUrl || ''), at: Date.now() });
 }
-async function fetchTeamLogoByName(teamName) {
+function buildEspnTeamsCacheKey(sportKey = '') {
+  return String(sportKey || '').trim().toLowerCase();
+}
+function resolveEspnLeaguePathFromSportKey(sportKey = '') {
+  const normalizedSportKey = String(sportKey || '').trim().toLowerCase();
+  return ESPN_LEAGUE_PATH_BY_SPORT_KEY[normalizedSportKey] || '';
+}
+function readEspnTeamsDirectoryCache(cacheKey) {
+  const hit = espnTeamsDirectoryCache.get(cacheKey);
+  if (!hit) return null;
+  if ((Date.now() - Number(hit.at || 0)) > ESPN_TEAM_DIRECTORY_TTL_MS) {
+    espnTeamsDirectoryCache.delete(cacheKey);
+    return null;
+  }
+  return Array.isArray(hit.teams) ? hit.teams : [];
+}
+function writeEspnTeamsDirectoryCache(cacheKey, teams) {
+  espnTeamsDirectoryCache.set(cacheKey, { teams: Array.isArray(teams) ? teams : [], at: Date.now() });
+}
+async function fetchEspnTeamsDirectoryBySportKey(sportKey = '') {
+  const leaguePath = resolveEspnLeaguePathFromSportKey(sportKey);
+  if (!leaguePath) return [];
+  const cacheKey = buildEspnTeamsCacheKey(sportKey);
+  const cached = readEspnTeamsDirectoryCache(cacheKey);
+  if (cached) return cached;
+  try {
+    const url = `https://site.api.espn.com/apis/site/v2/sports/${leaguePath}/teams?limit=500`;
+    const resp = await axios.get(url, { timeout: 9000 });
+    const teams = Array.isArray(resp?.data?.sports?.[0]?.leagues?.[0]?.teams)
+      ? resp.data.sports[0].leagues[0].teams
+      : [];
+    const normalized = teams.map((entry) => ({
+      name: String(entry?.team?.displayName || entry?.team?.name || entry?.team?.shortDisplayName || '').trim(),
+      logo: String(entry?.team?.logos?.[0]?.href || entry?.team?.logo || '').trim()
+    }))
+      .filter((entry) => entry.name && entry.logo);
+    writeEspnTeamsDirectoryCache(cacheKey, normalized);
+    return normalized;
+  } catch {
+    return [];
+  }
+}
+async function fetchTeamLogoByName(teamName, sportKey = '') {
   const cleanName = String(teamName || '').trim();
   if (!cleanName) return '';
+  const espnTeams = await fetchEspnTeamsDirectoryBySportKey(sportKey);
+  if (espnTeams.length > 0) {
+    const normalizedTarget = normalizeTeamName(cleanName);
+    const exact = espnTeams.find((entry) => normalizeTeamName(entry.name) === normalizedTarget);
+    if (exact?.logo) return exact.logo;
+    let bestCandidate = null;
+    let bestScore = -1;
+    for (const entry of espnTeams) {
+      const candidateScore = scoreNameMatch(cleanName, entry.name);
+      if (candidateScore > bestScore) {
+        bestScore = candidateScore;
+        bestCandidate = entry;
+      }
+    }
+    if (bestCandidate?.logo && bestScore >= 2) return bestCandidate.logo;
+  }
   try {
     const url = `https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=${encodeURIComponent(cleanName)}`;
     const resp = await axios.get(url, { timeout: 9000 });
     const teams = Array.isArray(resp?.data?.teams) ? resp.data.teams : [];
     if (!teams.length) return '';
-    const exact = teams.find((row) => String(row?.strTeam || '').trim().toLowerCase() === cleanName.toLowerCase());
-    const candidate = exact || teams[0];
-    return String(candidate?.strBadge || candidate?.strTeamBadge || candidate?.strLogo || '').trim();
+    const normalizedTarget = normalizeTeamName(cleanName);
+    const exact = teams.find((row) => normalizeTeamName(String(row?.strTeam || '').trim()) === normalizedTarget);
+    if (exact) return String(exact?.strBadge || exact?.strTeamBadge || exact?.strLogo || '').trim();
+    let bestCandidate = null;
+    let bestScore = -1;
+    for (const row of teams) {
+      const candidateName = String(row?.strTeam || '').trim();
+      if (!candidateName) continue;
+      const candidateScore = scoreNameMatch(cleanName, candidateName);
+      if (candidateScore > bestScore) {
+        bestScore = candidateScore;
+        bestCandidate = row;
+      }
+    }
+    if (bestCandidate && bestScore >= 3) {
+      return String(bestCandidate?.strBadge || bestCandidate?.strTeamBadge || bestCandidate?.strLogo || '').trim();
+    }
+    return '';
   } catch {
     return '';
   }
@@ -2102,7 +2191,7 @@ async function resolveTeamLogo(teamName, sportKey = '') {
   const cacheKey = buildTeamLogoCacheKey(teamName, sportKey);
   const cached = readTeamLogoCache(cacheKey);
   if (cached !== null) return cached;
-  const logo = await fetchTeamLogoByName(teamName);
+  const logo = await fetchTeamLogoByName(teamName, sportKey);
   writeTeamLogoCache(cacheKey, logo);
   return logo;
 }
