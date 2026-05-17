@@ -3161,7 +3161,13 @@ function resolveStandardMarket(bet, score) {
     };
   }
   const marketType = normalizeMarketType(bet?.marketType, bet?.betType);
-  evidence.push({ provider: 'odds-api', type: 'score', detail: `${score.home} ${homeScore} - ${awayScore} ${score.away}`, value: { homeScore, awayScore } });
+  const scoreProvider = toSafeString(score?.source) === 'api-sports-football' ? 'api-sports' : 'odds-api';
+  evidence.push({
+    provider: scoreProvider,
+    type: 'score',
+    detail: `${score.home} ${homeScore} - ${awayScore} ${score.away} (${scoreProvider})`,
+    value: { homeScore, awayScore, source: scoreProvider }
+  });
   if (marketType === 'parlay') {
     return {
       resultado: 'NECESITA_VERIFICACION',
@@ -3529,6 +3535,53 @@ Si no sabes un campo, usa null o string vacío según aplique.`;
   }
 }
 
+function extractTeamsFromFootballFixtureRow(row) {
+  return {
+    home: toSafeString(row?.teams?.home?.name),
+    away: toSafeString(row?.teams?.away?.name)
+  };
+}
+function isCompletedFootballFixture(row) {
+  const shortStatus = toSafeString(row?.fixture?.status?.short).toUpperCase();
+  if (['FT', 'AET', 'PEN', 'AWD', 'WO'].includes(shortStatus)) return true;
+  return false;
+}
+async function resolveSoccerScoreWithApiSports({ league, home, away, eventDate, explicitEventId = '', fallbackSportKey = 'soccer_epl' }) {
+  if (!APISPORTS_KEY) return null;
+  const providerTrace = [];
+  const candidates = [];
+  const dateCandidates = buildDateCandidates(eventDate);
+  for (const date of dateCandidates) {
+    const payload = await apiSportsGet('football', '/fixtures', { date }, providerTrace);
+    const rows = extractApiSportsRows(payload);
+    for (const row of rows) {
+      const teams = extractTeamsFromFootballFixtureRow(row);
+      const candidateScore = scoreNameMatch(home, teams.home) + scoreNameMatch(away, teams.away);
+      if (candidateScore > 0) candidates.push({ row, score: candidateScore });
+    }
+  }
+  const sorted = candidates.sort((a, b) => b.score - a.score);
+  const best = sorted[0];
+  if (!best || best.score < 3) return null;
+  const fixture = best.row?.fixture || {};
+  const goals = best.row?.goals || {};
+  const homeScore = toSafeNumber(goals?.home);
+  const awayScore = toSafeNumber(goals?.away);
+  if (homeScore === null || awayScore === null) return null;
+  const teams = extractTeamsFromFootballFixtureRow(best.row);
+  return {
+    eventId: toSafeString(fixture?.id || explicitEventId),
+    sportKey: fallbackSportKey,
+    home: teams.home || home,
+    away: teams.away || away,
+    homeScore,
+    awayScore,
+    completed: isCompletedFootballFixture(best.row),
+    commenceTime: toSafeString(fixture?.date || eventDate),
+    raw: best.row,
+    source: 'api-sports-football'
+  };
+}
 async function getMatchScore(league, home, away, explicitSportKey, explicitEventId = '') {
   try {
     const sportKey = explicitSportKey || resolveSportKeyFromContext({ sportKey: explicitSportKey, league, sport: '' });
@@ -3549,11 +3602,23 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
       }
       if (candidate?.score >= 100) break;
     }
-    if (!bestMatch || (!toSafeString(explicitEventId) && bestScore < 3)) return null;
+    if (!bestMatch || (!toSafeString(explicitEventId) && bestScore < 3)) {
+      if ((resolvedSportKey || sportKey).startsWith('soccer_')) {
+        return await resolveSoccerScoreWithApiSports({
+          league,
+          home,
+          away,
+          eventDate: '',
+          explicitEventId,
+          fallbackSportKey: resolvedSportKey || sportKey
+        });
+      }
+      return null;
+    }
     const scores = Array.isArray(bestMatch.scores) ? bestMatch.scores : [];
     const homeScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(bestMatch.home_team));
     const awayScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(bestMatch.away_team));
-    return {
+    const resolvedScore = {
       eventId: toSafeString(bestMatch.id),
       sportKey: resolvedSportKey,
       home: toSafeString(bestMatch.home_team),
@@ -3564,6 +3629,21 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
       commenceTime: toSafeString(bestMatch.commence_time),
       raw: bestMatch
     };
+    if (
+      resolvedScore.sportKey.startsWith('soccer_') &&
+      (resolvedScore.homeScore === null || resolvedScore.awayScore === null)
+    ) {
+      const fallback = await resolveSoccerScoreWithApiSports({
+        league,
+        home,
+        away,
+        eventDate: resolvedScore.commenceTime,
+        explicitEventId,
+        fallbackSportKey: resolvedScore.sportKey
+      });
+      if (fallback) return fallback;
+    }
+    return resolvedScore;
   } catch {
     return null;
   }
