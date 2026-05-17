@@ -4393,7 +4393,13 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
   let ocrMeta = { status: 'not_attempted', confidence: 0, warnings: [] };
   const shouldRunOcr = Boolean(
     toSafeString(pick?.ticketImg) &&
-    (options.forceOcr || !pick?.bet?.marketType || !pick?.bet?.selection || mergedBet.marketType === 'player_prop')
+    (
+      options.forceOcr ||
+      String(pick?.result || '').toLowerCase() === 'pending' ||
+      !pick?.bet?.marketType ||
+      !pick?.bet?.selection ||
+      mergedBet.marketType === 'player_prop'
+    )
   );
   if (shouldRunOcr) {
     const ocrResult = await extractTicketBetWithVision(pick, mergedBet);
