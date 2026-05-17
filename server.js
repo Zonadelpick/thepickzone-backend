@@ -4354,12 +4354,44 @@ async function analyzeAndPersistPick(pick, options = {}) {
   return updated;
 }
 
+function buildPendingPickAnalysisQuery(options = {}) {
+  if (options.pickId) {
+    return { _id: options.pickId };
+  }
+
+  if (options.includeRecent) {
+    return { result: 'pending' };
+  }
+
+  const now = Date.now();
+  const minAgeMinutes = Number.isFinite(Number(PICK_ANALYSIS_MIN_AGE_MINUTES))
+    ? Math.max(0, Number(PICK_ANALYSIS_MIN_AGE_MINUTES))
+    : 0;
+  const recheckMinutes = Number.isFinite(Number(PICK_ANALYSIS_RECHECK_MINUTES))
+    ? Math.max(1, Number(PICK_ANALYSIS_RECHECK_MINUTES))
+    : 30;
+  const minAgeCutoff = new Date(now - minAgeMinutes * 60 * 1000);
+  const recheckCutoff = new Date(now - recheckMinutes * 60 * 1000);
+
+  const query = {
+    result: 'pending',
+    $or: [
+      { 'verification.lastAnalyzedAt': { $exists: false } },
+      { 'verification.lastAnalyzedAt': { $lte: recheckCutoff } }
+    ]
+  };
+  if (minAgeMinutes > 0) {
+    query.createdAt = { $lte: minAgeCutoff };
+  }
+  return query;
+}
+
 async function runPickAnalysis(options = {}) {
-  const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
-  const query = options.pickId
-    ? { _id: options.pickId }
-    : { result: 'pending', createdAt: options.includeRecent ? { $exists: true } : { $lt: sixHoursAgo } };
-  const picks = await Pick.find(query);
+  const query = buildPendingPickAnalysisQuery(options);
+  const batchLimit = Number.isFinite(Number(PICK_ANALYSIS_BATCH_LIMIT))
+    ? Math.max(1, Number(PICK_ANALYSIS_BATCH_LIMIT))
+    : 200;
+  const picks = await Pick.find(query).sort({ createdAt: 1 }).limit(batchLimit);
   const summary = { total: picks.length, analyzed: 0, failed: 0, pending: 0, autoClosed: 0, results: [] };
   for (const pick of picks) {
     try {
@@ -4383,6 +4415,15 @@ async function runPickAnalysis(options = {}) {
 const PICK_ANALYSIS_INTERVAL_MS = Number.isFinite(Number(process.env.PICK_ANALYSIS_INTERVAL_MS))
   ? Math.max(60_000, Number(process.env.PICK_ANALYSIS_INTERVAL_MS))
   : 15 * 60 * 1000;
+const PICK_ANALYSIS_RECHECK_MINUTES = Number.isFinite(Number(process.env.PICK_ANALYSIS_RECHECK_MINUTES))
+  ? Math.max(1, Number(process.env.PICK_ANALYSIS_RECHECK_MINUTES))
+  : 30;
+const PICK_ANALYSIS_MIN_AGE_MINUTES = Number.isFinite(Number(process.env.PICK_ANALYSIS_MIN_AGE_MINUTES))
+  ? Math.max(0, Number(process.env.PICK_ANALYSIS_MIN_AGE_MINUTES))
+  : 0;
+const PICK_ANALYSIS_BATCH_LIMIT = Number.isFinite(Number(process.env.PICK_ANALYSIS_BATCH_LIMIT))
+  ? Math.max(1, Number(process.env.PICK_ANALYSIS_BATCH_LIMIT))
+  : 200;
 
 setTimeout(() => {
   runPickAnalysis({ includeRecent: false, forceOcr: false })
