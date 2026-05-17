@@ -41,6 +41,9 @@ test('shouldAutoClosePick uses market-specific threshold', () => {
     needsReview: false,
     confidence: 88,
     marketType: 'player_prop',
+    extractionQuality: 80,
+    eventMatchQuality: 80,
+    officialDataQuality: 90,
     thresholdConfig
   });
   assert.equal(lowConfidence.shouldAutoClose, false);
@@ -53,6 +56,9 @@ test('shouldAutoClosePick uses market-specific threshold', () => {
     needsReview: false,
     confidence: 90,
     marketType: 'player_prop',
+    extractionQuality: 80,
+    eventMatchQuality: 80,
+    officialDataQuality: 90,
     thresholdConfig
   });
   assert.equal(enoughConfidence.shouldAutoClose, true);
@@ -81,4 +87,35 @@ test('shouldAutoClosePick blocks when review is required or result is already fi
     thresholdConfig: cfg
   });
   assert.equal(alreadyResolved.shouldAutoClose, false);
+});
+
+test('shouldAutoClosePick blocks when reliability quality gates fail', () => {
+  const cfg = { defaultThreshold: 80, marketThresholds: {} };
+  const blockedByQuality = shouldAutoClosePick({
+    currentResult: 'pending',
+    aiOutcome: 'GANADO',
+    needsReview: false,
+    confidence: 95,
+    marketType: 'moneyline',
+    extractionQuality: 80,
+    eventMatchQuality: 55,
+    officialDataQuality: 92,
+    thresholdConfig: cfg
+  });
+  assert.equal(blockedByQuality.reliabilityGatePassed, false);
+  assert.equal(blockedByQuality.shouldAutoClose, false);
+
+  const passesQuality = shouldAutoClosePick({
+    currentResult: 'pending',
+    aiOutcome: 'GANADO',
+    needsReview: false,
+    confidence: 95,
+    marketType: 'moneyline',
+    extractionQuality: 80,
+    eventMatchQuality: 75,
+    officialDataQuality: 92,
+    thresholdConfig: cfg
+  });
+  assert.equal(passesQuality.reliabilityGatePassed, true);
+  assert.equal(passesQuality.shouldAutoClose, true);
 });

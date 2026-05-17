@@ -337,6 +337,15 @@ const findPickByIdentifier = async (pickIdentifier) => {
   return await Pick.findOne({ id: normalized });
 };
 const AUTO_CLOSE_THRESHOLD_CONFIG = resolveAutoCloseThresholdConfig(process.env);
+const AUTO_CLOSE_MIN_EXTRACTION_QUALITY = Number.isFinite(Number(process.env.AUTO_CLOSE_MIN_EXTRACTION_QUALITY))
+  ? Math.max(0, Math.min(100, Number(process.env.AUTO_CLOSE_MIN_EXTRACTION_QUALITY)))
+  : 55;
+const AUTO_CLOSE_MIN_EVENT_MATCH_QUALITY = Number.isFinite(Number(process.env.AUTO_CLOSE_MIN_EVENT_MATCH_QUALITY))
+  ? Math.max(0, Math.min(100, Number(process.env.AUTO_CLOSE_MIN_EVENT_MATCH_QUALITY)))
+  : 60;
+const AUTO_CLOSE_MIN_OFFICIAL_DATA_QUALITY = Number.isFinite(Number(process.env.AUTO_CLOSE_MIN_OFFICIAL_DATA_QUALITY))
+  ? Math.max(0, Math.min(100, Number(process.env.AUTO_CLOSE_MIN_OFFICIAL_DATA_QUALITY)))
+  : 70;
 
 const DEFAULT_PENDING_STALE_HOURS = Number.isFinite(Number(process.env.PICK_PENDING_STALE_HOURS))
   ? Math.max(1, Math.min(720, Number(process.env.PICK_PENDING_STALE_HOURS)))
@@ -3011,6 +3020,77 @@ function buildAiArgumentSummary({ aiAnalysis, bet }) {
   const reviewTag = aiAnalysis?.needsReview ? ' · requiere revisión admin' : '';
   return `Dictamen IA: ${outcomeLabel} (${confidence}%) · Mercado: ${marketType || 'desconocido'} · Selección: ${selection} · Argumento: ${detail}${reviewTag}`.slice(0, 420);
 }
+function scoreBetExtractionQuality(bet, ocrMeta) {
+  const normalizedBet = bet && typeof bet === 'object' ? bet : {};
+  const fields = [
+    Boolean(toSafeString(normalizedBet.marketType)),
+    Boolean(toSafeString(normalizedBet.selection) || toSafeString(normalizedBet.selectionLabel)),
+    Boolean(toSafeString(normalizedBet.side)),
+    toSafeNumber(normalizedBet.line) !== null || normalizeMarketType(normalizedBet.marketType, normalizedBet.betType) === 'moneyline',
+    Boolean(toSafeString(normalizedBet.homeTeam)),
+    Boolean(toSafeString(normalizedBet.awayTeam))
+  ];
+  const filledRatio = fields.filter(Boolean).length / fields.length;
+  const structureScore = Math.round(filledRatio * 70);
+  const normalizedOcrStatus = toSafeString(ocrMeta?.status).toLowerCase();
+  const normalizedOcrConfidence = clampNumber(ocrMeta?.confidence ?? 0, 0, 100, 0);
+  let ocrScore = 15;
+  if (normalizedOcrStatus === 'parsed') ocrScore = Math.round((normalizedOcrConfidence / 100) * 30);
+  if (normalizedOcrStatus === 'failed') ocrScore = 5;
+  const sourceToken = toSafeString(normalizedBet.source).toLowerCase();
+  const sourceBonus = sourceToken.includes('ocr') ? 0 : 10;
+  return clampNumber(structureScore + ocrScore + sourceBonus, 0, 100, 0);
+}
+function buildConfidenceBreakdown({ bet, ocrMeta, score, resolution, marketType }) {
+  const extractionQuality = scoreBetExtractionQuality(bet, ocrMeta);
+  const eventMatchQuality = clampNumber(
+    score?.matchScore !== undefined && score?.matchScore !== null
+      ? Math.round((Number(score.matchScore) / 10) * 100)
+      : (resolution?.eventMatchScore !== undefined && resolution?.eventMatchScore !== null
+        ? Math.round((Number(resolution.eventMatchScore) / 10) * 100)
+        : 0),
+    0,
+    100,
+    0
+  );
+  let officialDataQuality = 0;
+  if (marketType === 'player_prop') {
+    officialDataQuality = clampNumber(resolution?.officialDataQuality ?? (resolution?.resultado === 'NECESITA_VERIFICACION' ? 35 : 88), 0, 100, 0);
+  } else if (score?.completed && toSafeNumber(score?.homeScore) !== null && toSafeNumber(score?.awayScore) !== null) {
+    officialDataQuality = 90;
+  } else if (score?.completed) {
+    officialDataQuality = 55;
+  } else if (score) {
+    officialDataQuality = 25;
+  }
+  return {
+    extractionQuality,
+    eventMatchQuality,
+    officialDataQuality
+  };
+}
+function applyReliabilityGuardsToResolution(resolution, confidenceBreakdown) {
+  const baseResolution = resolution && typeof resolution === 'object' ? { ...resolution } : {};
+  const extractionQuality = clampNumber(confidenceBreakdown?.extractionQuality ?? 0, 0, 100, 0);
+  const eventMatchQuality = clampNumber(confidenceBreakdown?.eventMatchQuality ?? 0, 0, 100, 0);
+  const officialDataQuality = clampNumber(confidenceBreakdown?.officialDataQuality ?? 0, 0, 100, 0);
+  const weakestLink = Math.min(extractionQuality, eventMatchQuality, officialDataQuality);
+  if (['GANADO', 'PERDIDO', 'VOID'].includes(String(baseResolution?.resultado || '').toUpperCase())) {
+    const cappedConfidence = clampNumber(Math.min(baseResolution?.confianza ?? 0, weakestLink + 20), 0, 100, 0);
+    baseResolution.confianza = cappedConfidence;
+    if (officialDataQuality < 50 || eventMatchQuality < 45 || extractionQuality < 45) {
+      baseResolution.resultado = 'NECESITA_VERIFICACION';
+      baseResolution.needsReview = true;
+      baseResolution.detalle = `${toSafeString(baseResolution.detalle)} | Dictamen degradado por baja fiabilidad (extract:${extractionQuality}, match:${eventMatchQuality}, official:${officialDataQuality}).`.slice(0, 420);
+      return baseResolution;
+    }
+    if (extractionQuality < 60 || eventMatchQuality < 60 || officialDataQuality < 70) {
+      baseResolution.needsReview = true;
+      baseResolution.detalle = `${toSafeString(baseResolution.detalle)} | Requiere revisión por fiabilidad parcial (extract:${extractionQuality}, match:${eventMatchQuality}, official:${officialDataQuality}).`.slice(0, 420);
+    }
+  }
+  return baseResolution;
+}
 
 function extractJsonObject(text) {
   const raw = toSafeString(text);
@@ -3577,6 +3657,7 @@ async function resolveSoccerScoreWithApiSports({ league, home, away, eventDate, 
     homeScore,
     awayScore,
     completed: isCompletedFootballFixture(best.row),
+    matchScore: best.score,
     commenceTime: toSafeString(fixture?.date || eventDate),
     raw: best.row,
     source: 'api-sports-football'
@@ -3626,6 +3707,7 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
       homeScore: toSafeNumber(homeScoreEntry?.score),
       awayScore: toSafeNumber(awayScoreEntry?.score),
       completed: Boolean(bestMatch.completed),
+      matchScore: bestScore,
       commenceTime: toSafeString(bestMatch.commence_time),
       raw: bestMatch
     };
@@ -4238,6 +4320,8 @@ async function resolvePropMarket(pick, bet) {
       confianza: 25,
       detalle: 'Prop en deporte no soportado automáticamente.',
       needsReview: true,
+      eventMatchScore: 0,
+      officialDataQuality: 20,
       evidence: [],
       providerTrace
     };
@@ -4258,6 +4342,8 @@ async function resolvePropMarket(pick, bet) {
       confianza: 30,
       detalle: 'No se localizó evento en proveedor secundario de props.',
       needsReview: true,
+      eventMatchScore: 0,
+      officialDataQuality: 25,
       evidence: [],
       providerTrace
     };
@@ -4273,6 +4359,8 @@ async function resolvePropMarket(pick, bet) {
       confianza: 32,
       detalle: 'Prop incompleto: se requiere statType, línea y over/under.',
       needsReview: true,
+      eventMatchScore: eventLookup.score || 0,
+      officialDataQuality: 25,
       evidence: [],
       providerTrace
     };
@@ -4283,6 +4371,8 @@ async function resolvePropMarket(pick, bet) {
       confianza: 32,
       detalle: 'Prop incompleto: se requiere jugador para este tipo de mercado.',
       needsReview: true,
+      eventMatchScore: eventLookup.score || 0,
+      officialDataQuality: 30,
       evidence: [],
       providerTrace
     };
@@ -4313,15 +4403,17 @@ async function resolvePropMarket(pick, bet) {
       confianza: 35,
       detalle: statResult.message || 'Sin estadística oficial para prop.',
       needsReview: true,
+      eventMatchScore: eventLookup.score || 0,
+      officialDataQuality: 40,
       evidence: [],
       providerTrace
     };
   }
   const statValue = statResult.statValue;
+  const detailLabel = isFootballTeamProp
+    ? `${statType}: ${statValue} (${statResult.scope === 'team' ? (statResult.selectedTeam || 'equipo') : 'partido'})`
+    : `${statType}: ${statValue}`;
   if (statValue === line) {
-    const detailLabel = isFootballTeamProp
-      ? `${statType}: ${statValue} (${statResult.scope === 'team' ? (statResult.selectedTeam || 'equipo') : 'partido'})`
-      : `${statType}: ${statValue}`;
     return {
       resultado: 'VOID',
       confianza: 84,
@@ -4329,6 +4421,8 @@ async function resolvePropMarket(pick, bet) {
         ? `Prop soccer exacto: ${detailLabel} = línea ${line}.`
         : `${statResult.playerName} terminó con ${statValue}, exacto a la línea ${line}.`,
       needsReview: false,
+      eventMatchScore: eventLookup.score || 0,
+      officialDataQuality: 90,
       evidence: [{
         provider: 'api-sports',
         type: isFootballTeamProp ? 'team-prop' : 'player-prop',
@@ -4351,9 +4445,6 @@ async function resolvePropMarket(pick, bet) {
     };
   }
   const won = (side === 'over' && statValue > line) || (side === 'under' && statValue < line);
-  const detailLabel = isFootballTeamProp
-    ? `${statType}: ${statValue} (${statResult.scope === 'team' ? (statResult.selectedTeam || 'equipo') : 'partido'})`
-    : `${statType}: ${statValue}`;
   return {
     resultado: won ? 'GANADO' : 'PERDIDO',
     confianza: 86,
@@ -4365,6 +4456,8 @@ async function resolvePropMarket(pick, bet) {
           ? `${statResult.playerName} ${side} ${line} (${statType}: ${statValue})`
           : `${statResult.playerName} no cumplió ${side} ${line} (${statType}: ${statValue})`),
     needsReview: false,
+    eventMatchScore: eventLookup.score || 0,
+    officialDataQuality: 92,
     evidence: [{
       provider: 'api-sports',
       type: isFootballTeamProp ? 'team-prop' : 'player-prop',
@@ -4408,12 +4501,13 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
   }
   const marketType = normalizeMarketType(mergedBet.marketType, mergedBet.betType);
   mergedBet.marketType = marketType;
+  let score = null;
   let resolution = null;
   if (marketType === 'player_prop') {
     resolution = await resolvePropMarket(pick, mergedBet);
   } else {
     const [matchHome, matchAway] = splitMatchTeams(pick?.match);
-    const score = await getMatchScore(
+    score = await getMatchScore(
       pick?.league,
       mergedBet.homeTeam || matchHome || '',
       mergedBet.awayTeam || matchAway || '',
@@ -4436,6 +4530,14 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
       oddsSignal
     });
   }
+  const confidenceBreakdown = buildConfidenceBreakdown({
+    bet: mergedBet,
+    ocrMeta,
+    score,
+    resolution,
+    marketType
+  });
+  resolution = applyReliabilityGuardsToResolution(resolution, confidenceBreakdown);
   const aiAnalysis = {
     resultado: resolution.resultado || 'NECESITA_VERIFICACION',
     confianza: clampNumber(resolution.confianza, 0, 100, 0),
@@ -4443,6 +4545,12 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
     source: marketType === 'player_prop' ? 'deterministic+api-sports' : 'deterministic+odds',
     adminClosureRequired: true,
     needsReview: Boolean(resolution.needsReview),
+    confidenceBreakdown,
+    reliability: {
+      extractionQuality: confidenceBreakdown.extractionQuality,
+      eventMatchQuality: confidenceBreakdown.eventMatchQuality,
+      officialDataQuality: confidenceBreakdown.officialDataQuality
+    },
     evidence: Array.isArray(resolution.evidence) ? resolution.evidence.slice(0, 8) : []
   };
   const verificationStatus = aiAnalysis.resultado === 'PENDIENTE'
@@ -4457,6 +4565,12 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
     confidence: aiAnalysis.confianza,
     needsReview: aiAnalysis.needsReview,
     summary: buildAiArgumentSummary({ aiAnalysis, bet: mergedBet }),
+    confidenceBreakdown,
+    reliability: {
+      extractionQuality: confidenceBreakdown.extractionQuality,
+      eventMatchQuality: confidenceBreakdown.eventMatchQuality,
+      officialDataQuality: confidenceBreakdown.officialDataQuality
+    },
     engineVersion: AI_ENGINE_VERSION,
     lastAnalyzedAt: new Date(),
     ocr: {
@@ -4487,6 +4601,12 @@ async function analyzeAndPersistPick(pick, options = {}) {
     needsReview: computed?.aiAnalysis?.needsReview,
     confidence: computed?.aiAnalysis?.confianza,
     marketType: computed?.bet?.marketType,
+    extractionQuality: computed?.verification?.confidenceBreakdown?.extractionQuality,
+    eventMatchQuality: computed?.verification?.confidenceBreakdown?.eventMatchQuality,
+    officialDataQuality: computed?.verification?.confidenceBreakdown?.officialDataQuality,
+    minExtractionQuality: AUTO_CLOSE_MIN_EXTRACTION_QUALITY,
+    minEventMatchQuality: AUTO_CLOSE_MIN_EVENT_MATCH_QUALITY,
+    minOfficialDataQuality: AUTO_CLOSE_MIN_OFFICIAL_DATA_QUALITY,
     thresholdConfig: AUTO_CLOSE_THRESHOLD_CONFIG
   });
   const shouldAutoClose = Boolean(autoCloseDecision?.shouldAutoClose);
