@@ -2814,6 +2814,21 @@ const FOOTBALL_TEAM_STAT_LABEL_ALIASES = {
   fouls: ['fouls'],
   offsides: ['offsides', 'offside']
 };
+const LIGA_MX_TEAM_HINTS = [
+  'guadalajara', 'chivas', 'cruz azul', 'america', 'pumas', 'tigres', 'monterrey', 'toluca',
+  'pachuca', 'leon', 'santos', 'atlas', 'necaxa', 'juarez', 'queretaro', 'mazatlan',
+  'atletico san luis', 'puebla', 'tijuana'
+];
+const SOCCER_SCORE_FALLBACK_KEYS = [
+  'soccer_mexico_ligamx',
+  'soccer_usa_mls',
+  'soccer_epl',
+  'soccer_spain_la_liga',
+  'soccer_italy_serie_a',
+  'soccer_germany_bundesliga',
+  'soccer_france_ligue_one',
+  'soccer_uefa_champs_league'
+];
 
 function toSafeString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -2873,11 +2888,66 @@ function resolveSportKeyFromContext({ sportKey, league, sport }) {
   const leagueKey = SPORT_KEYS[toSafeString(league)];
   if (leagueKey) return leagueKey;
   const merged = `${toSafeString(league)} ${toSafeString(sport)} ${explicitSportKey}`.toLowerCase();
+  if (
+    merged.includes('liga mx') ||
+    merged.includes('ligamx') ||
+    merged.includes('mexico') ||
+    merged.includes('méxico')
+  ) return 'soccer_mexico_ligamx';
   if (merged.includes('nba')) return 'basketball_nba';
   if (merged.includes('mlb') || merged.includes('baseball')) return 'baseball_mlb';
   if (merged.includes('nfl') || merged.includes('football americano') || merged.includes('american football')) return 'americanfootball_nfl';
   if (merged.includes('soccer') || merged.includes('futbol') || merged.includes('football')) return 'soccer_epl';
   return explicitSportKey || '';
+}
+function looksLikeLigaMxContext({ league, sport, home, away }) {
+  const merged = `${toSafeString(league)} ${toSafeString(sport)} ${toSafeString(home)} ${toSafeString(away)}`.toLowerCase();
+  if (
+    merged.includes('liga mx') ||
+    merged.includes('ligamx') ||
+    merged.includes('mexico') ||
+    merged.includes('méxico')
+  ) return true;
+  return LIGA_MX_TEAM_HINTS.some((teamHint) => merged.includes(teamHint));
+}
+function buildSoccerScoreSearchKeys(primarySportKey, context = {}) {
+  const keys = [];
+  const primary = toSafeString(primarySportKey);
+  if (primary) keys.push(primary);
+  if (looksLikeLigaMxContext(context)) keys.unshift('soccer_mexico_ligamx');
+  SOCCER_SCORE_FALLBACK_KEYS.forEach((sportKey) => keys.push(sportKey));
+  return Array.from(new Set(keys.filter(Boolean)));
+}
+async function fetchScoreRowsBySportKey(sportKey) {
+  const normalizedSportKey = toSafeString(sportKey);
+  if (!normalizedSportKey || !process.env.ODDS_API_KEY) return [];
+  try {
+    const url = `https://api.the-odds-api.com/v4/sports/${normalizedSportKey}/scores?apiKey=${process.env.ODDS_API_KEY}&daysFrom=4`;
+    const resp = await axios.get(url, { timeout: 12000 });
+    return Array.isArray(resp?.data) ? resp.data : [];
+  } catch {
+    return [];
+  }
+}
+function resolveBestScoreRow(rows, { home, away, explicitEventId }) {
+  const normalizedEventId = toSafeString(explicitEventId);
+  const sourceRows = Array.isArray(rows) ? rows : [];
+  let bestMatch = null;
+  let bestScore = -1;
+  for (const row of sourceRows) {
+    if (!row) continue;
+    if (normalizedEventId && String(row.id || '') === normalizedEventId) {
+      return { row, score: 100 };
+    }
+    const homeScore = scoreNameMatch(home, row.home_team);
+    const awayScore = scoreNameMatch(away, row.away_team);
+    const candidateScore = homeScore + awayScore;
+    if (candidateScore > bestScore) {
+      bestScore = candidateScore;
+      bestMatch = row;
+    }
+  }
+  return { row: bestMatch, score: bestScore };
 }
 
 function resolveSecondarySportCode({ sportKey, sport, league }) {
@@ -3463,33 +3533,29 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
   try {
     const sportKey = explicitSportKey || resolveSportKeyFromContext({ sportKey: explicitSportKey, league, sport: '' });
     if (!sportKey || !process.env.ODDS_API_KEY) return null;
-    const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/scores?apiKey=${process.env.ODDS_API_KEY}&daysFrom=4`;
-    const resp = await axios.get(url, { timeout: 12000 });
-    const rows = Array.isArray(resp.data) ? resp.data : [];
-    const normalizedEventId = toSafeString(explicitEventId);
+    const searchKeys = sportKey.startsWith('soccer_')
+      ? buildSoccerScoreSearchKeys(sportKey, { league, sport: '', home, away })
+      : [sportKey];
     let bestMatch = null;
     let bestScore = -1;
-    for (const row of rows) {
-      if (!row) continue;
-      if (normalizedEventId && String(row.id || '') === normalizedEventId) {
-        bestMatch = row;
-        break;
+    let resolvedSportKey = sportKey;
+    for (const candidateSportKey of searchKeys) {
+      const rows = await fetchScoreRowsBySportKey(candidateSportKey);
+      const candidate = resolveBestScoreRow(rows, { home, away, explicitEventId });
+      if (candidate?.row && candidate.score > bestScore) {
+        bestMatch = candidate.row;
+        bestScore = candidate.score;
+        resolvedSportKey = candidateSportKey;
       }
-      const homeScore = scoreNameMatch(home, row.home_team);
-      const awayScore = scoreNameMatch(away, row.away_team);
-      const candidateScore = homeScore + awayScore;
-      if (candidateScore > bestScore) {
-        bestScore = candidateScore;
-        bestMatch = row;
-      }
+      if (candidate?.score >= 100) break;
     }
-    if (!bestMatch) return null;
+    if (!bestMatch || (!toSafeString(explicitEventId) && bestScore < 3)) return null;
     const scores = Array.isArray(bestMatch.scores) ? bestMatch.scores : [];
     const homeScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(bestMatch.home_team));
     const awayScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(bestMatch.away_team));
     return {
       eventId: toSafeString(bestMatch.id),
-      sportKey,
+      sportKey: resolvedSportKey,
       home: toSafeString(bestMatch.home_team),
       away: toSafeString(bestMatch.away_team),
       homeScore: toSafeNumber(homeScoreEntry?.score),
