@@ -2924,6 +2924,23 @@ function normalizeStatType(value) {
   }
   return token;
 }
+function formatAiOutcomeLabel(outcome) {
+  const normalized = String(outcome || '').trim().toUpperCase();
+  if (normalized === 'GANADO') return 'GANADO';
+  if (normalized === 'PERDIDO') return 'PERDIDO';
+  if (normalized === 'VOID') return 'VOID';
+  if (normalized === 'PENDIENTE') return 'PENDIENTE';
+  return 'NECESITA_VERIFICACION';
+}
+function buildAiArgumentSummary({ aiAnalysis, bet }) {
+  const outcomeLabel = formatAiOutcomeLabel(aiAnalysis?.resultado);
+  const confidence = clampNumber(aiAnalysis?.confianza ?? 0, 0, 100, 0);
+  const marketType = normalizeMarketType(bet?.marketType, bet?.betType);
+  const selection = toSafeString(bet?.selectionLabel || bet?.selection) || 'selección no identificada';
+  const detail = toSafeString(aiAnalysis?.detalle || 'Sin detalle de validación');
+  const reviewTag = aiAnalysis?.needsReview ? ' · requiere revisión admin' : '';
+  return `Dictamen IA: ${outcomeLabel} (${confidence}%) · Mercado: ${marketType || 'desconocido'} · Selección: ${selection} · Argumento: ${detail}${reviewTag}`.slice(0, 420);
+}
 
 function extractJsonObject(text) {
   const raw = toSafeString(text);
@@ -4287,7 +4304,7 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
     preliminaryResult: aiAnalysis.resultado,
     confidence: aiAnalysis.confianza,
     needsReview: aiAnalysis.needsReview,
-    summary: aiAnalysis.detalle,
+    summary: buildAiArgumentSummary({ aiAnalysis, bet: mergedBet }),
     engineVersion: AI_ENGINE_VERSION,
     lastAnalyzedAt: new Date(),
     ocr: {
