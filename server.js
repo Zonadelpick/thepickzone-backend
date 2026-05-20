@@ -12,9 +12,37 @@ try {
 } catch {
   Resvg = null;
 }
+async function runPendingImagePickAnalysis(options = {}) {
+  const limit = Number.isFinite(Number(options?.limit))
+    ? Math.max(1, Math.min(300, Number(options.limit)))
+    : 120;
+  const picks = await Pick.find({ result: 'pending' }).sort({ createdAt: 1 }).limit(limit);
+  const summary = { total: picks.length, analyzed: 0, failed: 0, pending: 0, autoClosed: 0, skipped: 0, results: [] };
+  for (const pick of picks) {
+    try {
+      const updated = await analyzePickImageAndPersist(pick);
+      summary.analyzed += 1;
+      if (String(updated?.result || 'pending').toLowerCase() === 'pending') summary.pending += 1;
+      else summary.autoClosed += 1;
+      summary.results.push({
+        pickId: String(pick._id),
+        result: updated?.result || 'pending',
+        confianza: Number(updated?.aiAnalysis?.confianza || 0),
+        resultado: updated?.aiAnalysis?.resultado || 'NECESITA_VERIFICACION'
+      });
+    } catch (error) {
+      const isPendingEvent = String(error?.message || '').includes('Partido aún no finalizado');
+      if (isPendingEvent) summary.skipped += 1;
+      else summary.failed += 1;
+      summary.results.push({ pickId: String(pick._id), error: error.message || 'analysis_failed' });
+    }
+  }
+  return summary;
+}
 const {
   resolveAutoCloseThresholdConfig,
-  shouldAutoClosePick
+  shouldAutoClosePick,
+  mapAiOutcomeToPickResult
 } = require('./autoCloseRules');
 require('dotenv').config();
 
@@ -2782,6 +2810,7 @@ app.post('/api/admin/clean-db', async (req, res) => {
 const Anthropic = require('@anthropic-ai/sdk');
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const AI_ENGINE_VERSION = 'v2-ocr-props-20260512';
+const GOOGLE_VISION_KEY = (process.env.GOOGLE_VISION_KEY || '').trim();
 const APISPORTS_KEY = (process.env.APISPORTS_KEY || process.env.APISPORTS_API_KEY || '').trim();
 const APISPORTS_BASE_URLS = {
   basketball: (process.env.APISPORTS_BASKETBALL_BASE_URL || 'https://v1.basketball.api-sports.io').trim(),
@@ -3109,6 +3138,207 @@ function parseDataUrlImage(dataUrl) {
   const match = toSafeString(dataUrl).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
   if (!match) return null;
   return { mediaType: match[1], data: match[2] };
+}
+async function extractTextWithGoogleVisionFromTicket(ticketImg) {
+  if (!GOOGLE_VISION_KEY) {
+    return { text: '', confidence: 0, status: 'failed', warnings: ['GOOGLE_VISION_KEY no configurado'] };
+  }
+  const parsedImage = parseDataUrlImage(ticketImg);
+  if (!parsedImage?.data) {
+    return { text: '', confidence: 0, status: 'failed', warnings: ['ticketImg no válido para Google Vision'] };
+  }
+  try {
+    const response = await axios.post(
+      `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_KEY}`,
+      {
+        requests: [{
+          image: { content: parsedImage.data },
+          features: [{ type: 'TEXT_DETECTION', maxResults: 1 }]
+        }]
+      },
+      { timeout: 20000 }
+    );
+    const visionPayload = response?.data?.responses?.[0] || {};
+    const extractedText = toSafeString(
+      visionPayload?.fullTextAnnotation?.text ||
+      visionPayload?.textAnnotations?.[0]?.description ||
+      ''
+    );
+    if (!extractedText) {
+      return { text: '', confidence: 0, status: 'failed', warnings: ['Google Vision no detectó texto'] };
+    }
+    return {
+      text: extractedText.slice(0, 16000),
+      confidence: 82,
+      status: 'parsed',
+      warnings: []
+    };
+  } catch (error) {
+    return {
+      text: '',
+      confidence: 0,
+      status: 'failed',
+      warnings: [error?.message || 'Error en Google Vision']
+    };
+  }
+}
+async function compareTicketVsOfficialWithClaude({ pick, ticketText, officialScore }) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 0,
+      detalle: 'ANTHROPIC_API_KEY no configurado'
+    };
+  }
+  const prompt = `Compara ticket vs resultado oficial y responde SOLO JSON válido con:
+{"resultado":"GANADO|PERDIDO|VOID|NECESITA_VERIFICACION","confianza":0-100,"detalle":"explicacion breve"}
+Datos pick:
+- match: ${toSafeString(pick?.match)}
+- league: ${toSafeString(pick?.league)}
+- odds: ${toSafeString(pick?.odds)}
+- time: ${toSafeString(pick?.time)}
+Texto OCR del ticket:
+${toSafeString(ticketText).slice(0, 6000)}
+Resultado oficial:
+- home: ${toSafeString(officialScore?.home)}
+- away: ${toSafeString(officialScore?.away)}
+- homeScore: ${officialScore?.homeScore ?? null}
+- awayScore: ${officialScore?.awayScore ?? null}
+- completed: ${Boolean(officialScore?.completed)}
+Si no alcanza evidencia suficiente, usa NECESITA_VERIFICACION.`;
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 450,
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }]
+    });
+    const answer = Array.isArray(response?.content)
+      ? response.content.map((chunk) => chunk?.text || '').join('\n')
+      : '';
+    const parsed = extractJsonObject(answer) || {};
+    return {
+      resultado: formatAiOutcomeLabel(parsed?.resultado),
+      confianza: clampNumber(parsed?.confianza ?? 0, 0, 100, 0),
+      detalle: toSafeString(parsed?.detalle || 'Comparación IA sin detalle').slice(0, 400),
+      raw: toSafeString(answer).slice(0, 2000)
+    };
+  } catch (error) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 0,
+      detalle: toSafeString(error?.message || 'Error de análisis Claude').slice(0, 400)
+    };
+  }
+}
+async function analyzePickImage(pick) {
+  const [matchHome, matchAway] = splitMatchTeams(pick?.match);
+  const baseBet = buildBetFromPick(pick);
+  const homeTeam = baseBet?.homeTeam || matchHome || '';
+  const awayTeam = baseBet?.awayTeam || matchAway || '';
+  const officialScore = await getMatchScore(
+    pick?.league,
+    homeTeam,
+    awayTeam,
+    baseBet?.sportKey || pick?.sportKey,
+    baseBet?.eventId || ''
+  );
+  if (!officialScore?.completed) {
+    return {
+      resultado: 'PENDIENTE',
+      confianza: 20,
+      detalle: 'Partido aún no finalizado o sin marcador oficial definitivo.',
+      needsReview: false,
+      officialScore,
+      ocr: { status: 'not_attempted', confidence: 0, warnings: ['Evento no finalizado'] }
+    };
+  }
+  const ocr = await extractTextWithGoogleVisionFromTicket(pick?.ticketImg);
+  if (!toSafeString(ocr?.text)) {
+    return {
+      resultado: 'NECESITA_VERIFICACION',
+      confianza: 25,
+      detalle: 'No se pudo extraer texto del ticket con Google Vision.',
+      needsReview: true,
+      officialScore,
+      ocr
+    };
+  }
+  const claudeVerdict = await compareTicketVsOfficialWithClaude({
+    pick,
+    ticketText: ocr.text,
+    officialScore
+  });
+  return {
+    resultado: formatAiOutcomeLabel(claudeVerdict?.resultado),
+    confianza: clampNumber(claudeVerdict?.confianza ?? 0, 0, 100, 0),
+    detalle: toSafeString(claudeVerdict?.detalle || 'Sin detalle'),
+    needsReview: clampNumber(claudeVerdict?.confianza ?? 0, 0, 100, 0) < 85,
+    officialScore,
+    ocr,
+    raw: claudeVerdict?.raw || ''
+  };
+}
+async function analyzePickImageAndPersist(pick) {
+  const pickDoc = (pick && typeof pick.save === 'function')
+    ? pick
+    : await findPickByIdentifier(pick?._id || pick?.id);
+  if (!pickDoc) throw new Error('pick_not_found');
+  const analysis = await analyzePickImage(pickDoc);
+  const mappedResult = mapAiOutcomeToPickResult(analysis?.resultado);
+  const shouldApprove = Boolean(mappedResult && Number(analysis?.confianza || 0) >= 85);
+  const aiAnalysis = {
+    resultado: analysis?.resultado || 'NECESITA_VERIFICACION',
+    confianza: clampNumber(analysis?.confianza ?? 0, 0, 100, 0),
+    detalle: toSafeString(analysis?.detalle || 'Sin detalle'),
+    source: 'google-vision+odds-api+claude',
+    needsReview: Boolean(analysis?.needsReview ?? !shouldApprove),
+    ocr: {
+      status: toSafeString(analysis?.ocr?.status) || 'failed',
+      confidence: clampNumber(analysis?.ocr?.confidence ?? 0, 0, 100, 0),
+      warnings: Array.isArray(analysis?.ocr?.warnings) ? analysis.ocr.warnings.slice(0, 8) : [],
+      textSnippet: toSafeString(analysis?.ocr?.text || '').slice(0, 1200)
+    },
+    officialScore: analysis?.officialScore ? {
+      home: toSafeString(analysis.officialScore.home),
+      away: toSafeString(analysis.officialScore.away),
+      homeScore: toSafeNumber(analysis.officialScore.homeScore),
+      awayScore: toSafeNumber(analysis.officialScore.awayScore),
+      completed: Boolean(analysis.officialScore.completed)
+    } : null
+  };
+  const verificationStatus = shouldApprove
+    ? 'closed_auto'
+    : aiAnalysis.resultado === 'PENDIENTE'
+      ? 'pending_data'
+      : 'needs_review';
+  const verification = {
+    ...(pickDoc?.verification || {}),
+    status: verificationStatus,
+    preliminaryResult: aiAnalysis.resultado,
+    confidence: aiAnalysis.confianza,
+    needsReview: aiAnalysis.needsReview,
+    summary: buildAiArgumentSummary({ aiAnalysis, bet: pickDoc?.bet || buildBetFromPick(pickDoc) }),
+    lastAnalyzedAt: new Date(),
+    lastClosedAt: shouldApprove ? new Date() : (pickDoc?.verification?.lastClosedAt || null),
+    engineVersion: AI_ENGINE_VERSION,
+    ocr: {
+      status: aiAnalysis?.ocr?.status || 'failed',
+      confidence: aiAnalysis?.ocr?.confidence || 0,
+      parsedAt: aiAnalysis?.ocr?.status === 'parsed' ? new Date() : null,
+      warnings: aiAnalysis?.ocr?.warnings || [],
+      raw: { provider: 'google-vision', textSnippet: aiAnalysis?.ocr?.textSnippet || '' }
+    }
+  };
+  pickDoc.set('aiAnalysis', aiAnalysis);
+  pickDoc.set('verification', verification);
+  if (shouldApprove) {
+    pickDoc.set('result', mappedResult);
+  }
+  const updated = await pickDoc.save();
+  if (shouldApprove && pickDoc?.tipsterId) {
+    await safeRecalculateTipsterStats(pickDoc.tipsterId, `analyzePickImageAndPersist:${pickDoc?._id}`);
+  }
+  return updated;
 }
 
 function buildProviderTrace(provider, endpoint, ok, message, extra = {}) {
@@ -4703,7 +4933,7 @@ async function runPickAnalysis(options = {}) {
 }
 const PICK_ANALYSIS_INTERVAL_MS = Number.isFinite(Number(process.env.PICK_ANALYSIS_INTERVAL_MS))
   ? Math.max(60_000, Number(process.env.PICK_ANALYSIS_INTERVAL_MS))
-  : 15 * 60 * 1000;
+  : 60 * 60 * 1000;
 const PICK_ANALYSIS_RECHECK_MINUTES = Number.isFinite(Number(process.env.PICK_ANALYSIS_RECHECK_MINUTES))
   ? Math.max(1, Number(process.env.PICK_ANALYSIS_RECHECK_MINUTES))
   : 30;
@@ -4715,13 +4945,13 @@ const PICK_ANALYSIS_BATCH_LIMIT = Number.isFinite(Number(process.env.PICK_ANALYS
   : 200;
 
 setTimeout(() => {
-  runPickAnalysis({ includeRecent: false, forceOcr: false })
-    .catch((error) => console.error('initial runPickAnalysis error:', error.message || error));
+  runPendingImagePickAnalysis({ limit: PICK_ANALYSIS_BATCH_LIMIT })
+    .catch((error) => console.error('initial runPendingImagePickAnalysis error:', error.message || error));
 }, 15_000);
 
 setInterval(() => {
-  runPickAnalysis({ includeRecent: false, forceOcr: false })
-    .catch((error) => console.error('runPickAnalysis error:', error.message || error));
+  runPendingImagePickAnalysis({ limit: PICK_ANALYSIS_BATCH_LIMIT })
+    .catch((error) => console.error('runPendingImagePickAnalysis error:', error.message || error));
 }, PICK_ANALYSIS_INTERVAL_MS);
 
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
@@ -4737,7 +4967,7 @@ app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
   try {
     const pick = await findPickByIdentifier(req.params.id);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
-    const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
+    const updated = await analyzePickImageAndPersist(pick);
     res.json({
       success: true,
       analysis: updated?.aiAnalysis || null,
