@@ -2611,7 +2611,7 @@ app.post('/api/admin/picks/reanalyze-stale', auth, requireAdmin, async (req, res
     const summary = { total: stalePicks.length, analyzed: 0, failed: 0, autoClosed: 0, pending: 0, results: [] };
     for (const pick of stalePicks) {
       try {
-        const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
+        const updated = await analyzePickImageAndPersist(pick);
         summary.analyzed += 1;
         if (String(updated?.result || 'pending').toLowerCase() === 'pending') {
           summary.pending += 1;
@@ -2695,7 +2695,7 @@ app.post('/api/admin/picks/bulk-analyze', auth, requireAdmin, async (req, res) =
         continue;
       }
       try {
-        const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
+        const updated = await analyzePickImageAndPersist(pick);
         summary.analyzed += 1;
         if (String(updated?.result || 'pending').toLowerCase() === 'pending') {
           summary.pending += 1;
@@ -5017,7 +5017,10 @@ setInterval(() => {
 
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   try {
-    const summary = await runPickAnalysis({ includeRecent: true, forceOcr: true });
+    const limit = Number.isFinite(Number(req.body?.limit ?? req.query.limit))
+      ? Math.max(1, Math.min(300, Number(req.body?.limit ?? req.query.limit)))
+      : PICK_ANALYSIS_BATCH_LIMIT;
+    const summary = await runPendingImagePickAnalysis({ limit });
     res.json({ success: true, ...summary });
   } catch (error) {
     res.status(500).json({ error: error.message });
