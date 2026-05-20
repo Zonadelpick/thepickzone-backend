@@ -12,33 +12,6 @@ try {
 } catch {
   Resvg = null;
 }
-async function runPendingImagePickAnalysis(options = {}) {
-  const limit = Number.isFinite(Number(options?.limit))
-    ? Math.max(1, Math.min(300, Number(options.limit)))
-    : 120;
-  const picks = await Pick.find({ result: 'pending' }).sort({ createdAt: 1 }).limit(limit);
-  const summary = { total: picks.length, analyzed: 0, failed: 0, pending: 0, autoClosed: 0, skipped: 0, results: [] };
-  for (const pick of picks) {
-    try {
-      const updated = await analyzePickImageAndPersist(pick);
-      summary.analyzed += 1;
-      if (String(updated?.result || 'pending').toLowerCase() === 'pending') summary.pending += 1;
-      else summary.autoClosed += 1;
-      summary.results.push({
-        pickId: String(pick._id),
-        result: updated?.result || 'pending',
-        confianza: Number(updated?.aiAnalysis?.confianza || 0),
-        resultado: updated?.aiAnalysis?.resultado || 'NECESITA_VERIFICACION'
-      });
-    } catch (error) {
-      const isPendingEvent = String(error?.message || '').includes('Partido aún no finalizado');
-      if (isPendingEvent) summary.skipped += 1;
-      else summary.failed += 1;
-      summary.results.push({ pickId: String(pick._id), error: error.message || 'analysis_failed' });
-    }
-  }
-  return summary;
-}
 const {
   resolveAutoCloseThresholdConfig,
   shouldAutoClosePick,
@@ -4903,6 +4876,33 @@ function buildPendingPickAnalysisQuery(options = {}) {
     query.createdAt = { $lte: minAgeCutoff };
   }
   return query;
+}
+async function runPendingImagePickAnalysis(options = {}) {
+  const limit = Number.isFinite(Number(options?.limit))
+    ? Math.max(1, Math.min(300, Number(options.limit)))
+    : 120;
+  const picks = await Pick.find({ result: 'pending' }).sort({ createdAt: 1 }).limit(limit);
+  const summary = { total: picks.length, analyzed: 0, failed: 0, pending: 0, autoClosed: 0, skipped: 0, results: [] };
+  for (const pick of picks) {
+    try {
+      const updated = await analyzePickImageAndPersist(pick);
+      summary.analyzed += 1;
+      if (String(updated?.result || 'pending').toLowerCase() === 'pending') summary.pending += 1;
+      else summary.autoClosed += 1;
+      summary.results.push({
+        pickId: String(pick._id),
+        result: updated?.result || 'pending',
+        confianza: Number(updated?.aiAnalysis?.confianza || 0),
+        resultado: updated?.aiAnalysis?.resultado || 'NECESITA_VERIFICACION'
+      });
+    } catch (error) {
+      const isPendingEvent = String(error?.message || '').includes('Partido aún no finalizado');
+      if (isPendingEvent) summary.skipped += 1;
+      else summary.failed += 1;
+      summary.results.push({ pickId: String(pick._id), error: error.message || 'analysis_failed' });
+    }
+  }
+  return summary;
 }
 
 async function runPickAnalysis(options = {}) {
