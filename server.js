@@ -2960,6 +2960,56 @@ function resolveBestScoreRow(rows, { home, away, explicitEventId }) {
   }
   return { row: bestMatch, score: bestScore };
 }
+function buildOfficialScoreFallbackKeys({ primarySportKey, league, sport, home, away }) {
+  const keys = [];
+  const primary = toSafeString(primarySportKey) || resolveSportKeyFromContext({ sportKey: primarySportKey, league, sport });
+  if (primary) keys.push(primary);
+  if (primary.startsWith('soccer_') || looksLikeLigaMxContext({ league, sport, home, away })) {
+    buildSoccerScoreSearchKeys(primary || 'soccer_mexico_ligamx', { league, sport, home, away }).forEach((key) => keys.push(key));
+  }
+  [
+    'basketball_nba',
+    'baseball_mlb',
+    'americanfootball_nfl',
+    'icehockey_nhl'
+  ].forEach((key) => keys.push(key));
+  return Array.from(new Set(keys.filter(Boolean)));
+}
+async function findCompletedOfficialScoreFallback({ league, sport, sportKey, home, away, explicitEventId = '' }) {
+  const fallbackKeys = buildOfficialScoreFallbackKeys({ primarySportKey: sportKey, league, sport, home, away });
+  let bestCandidate = null;
+  let bestCandidateScore = -1;
+  for (const candidateSportKey of fallbackKeys) {
+    const rows = await fetchScoreRowsBySportKey(candidateSportKey);
+    if (!rows.length) continue;
+    const { row, score } = resolveBestScoreRow(rows, { home, away, explicitEventId });
+    if (!row || score < 2) continue;
+    const scores = Array.isArray(row.scores) ? row.scores : [];
+    const homeScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(row.home_team));
+    const awayScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(row.away_team));
+    const homeScore = toSafeNumber(homeScoreEntry?.score);
+    const awayScore = toSafeNumber(awayScoreEntry?.score);
+    if (homeScore === null || awayScore === null) continue;
+    const candidate = {
+      eventId: toSafeString(row.id),
+      sportKey: candidateSportKey,
+      home: toSafeString(row.home_team),
+      away: toSafeString(row.away_team),
+      homeScore,
+      awayScore,
+      completed: Boolean(row.completed),
+      matchScore: score,
+      commenceTime: toSafeString(row.commence_time),
+      raw: row
+    };
+    if (candidate.completed) return candidate;
+    if (score > bestCandidateScore) {
+      bestCandidate = candidate;
+      bestCandidateScore = score;
+    }
+  }
+  return bestCandidate;
+}
 
 function resolveSecondarySportCode({ sportKey, sport, league }) {
   const merged = `${toSafeString(sportKey)} ${toSafeString(sport)} ${toSafeString(league)}`.toLowerCase();
@@ -3208,13 +3258,24 @@ async function analyzePickImage(pick) {
   const baseBet = buildBetFromPick(pick);
   const homeTeam = baseBet?.homeTeam || matchHome || '';
   const awayTeam = baseBet?.awayTeam || matchAway || '';
-  const officialScore = await getMatchScore(
+  let officialScore = await getMatchScore(
     pick?.league,
     homeTeam,
     awayTeam,
     baseBet?.sportKey || pick?.sportKey,
     baseBet?.eventId || ''
   );
+  if (!officialScore?.completed) {
+    const fallbackOfficialScore = await findCompletedOfficialScoreFallback({
+      league: pick?.league,
+      sport: pick?.sport || baseBet?.sport,
+      sportKey: baseBet?.sportKey || pick?.sportKey,
+      home: homeTeam,
+      away: awayTeam,
+      explicitEventId: baseBet?.eventId || ''
+    });
+    if (fallbackOfficialScore) officialScore = fallbackOfficialScore;
+  }
   if (!officialScore?.completed) {
     return {
       resultado: 'PENDIENTE',
