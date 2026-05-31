@@ -20,8 +20,16 @@ const {
 require('dotenv').config();
 
 const app = express();
+const STRIPE_WEBHOOK_PATH = '/api/stripe/webhook';
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, res, buf) => {
+    if (req?.originalUrl && String(req.originalUrl).startsWith(STRIPE_WEBHOOK_PATH)) {
+      req.rawBody = Buffer.from(buf);
+    }
+  }
+}));
 app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
     return res.status(400).json({ error: 'JSON inválido en el body de la solicitud' });
@@ -56,12 +64,30 @@ if (STRIPE_LIVE_REQUIRED && STRIPE_MODE !== 'live') {
 }
 console.log(`[Stripe] initialized in ${STRIPE_MODE} mode`);
 const stripe = new Stripe(STRIPE_SECRET_KEY);
+const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+const STRIPE_PRO_PRICE_ID = String(process.env.STRIPE_PRO_PRICE_ID || '').trim();
 const PRO_PLAN_AMOUNT_USD = 29.99;
 const PRO_PLAN_AMOUNT_CENTS = Math.round(PRO_PLAN_AMOUNT_USD * 100);
 const PRO_PLAN_DURATION_DAYS = 30;
+const resolveMongoUri = () => {
+  const candidates = [
+    process.env.MONGO_URI,
+    process.env.MONGODB_URI,
+    process.env.DATABASE_URL
+  ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || '').trim();
+    if (normalized) return normalized;
+  }
+  return '';
+};
+const MONGO_URI = resolveMongoUri();
+if (!MONGO_URI) {
+  throw new Error('MongoDB no configurado: define MONGO_URI o MONGODB_URI');
+}
 
 // ── MONGODB ──────────────────────────────────────────────────────────────────
-mongoose.connect(process.env.MONGO_URI).then(()=>console.log('MongoDB connected')).catch(e=>console.error(e));
+mongoose.connect(MONGO_URI).then(()=>console.log('MongoDB connected')).catch(e=>console.error(e));
 
 // ── MODELS ───────────────────────────────────────────────────────────────────
 const UserSchema = new mongoose.Schema({
@@ -97,6 +123,10 @@ const UserSchema = new mongoose.Schema({
   passwordResetExpiresAt: { type: Date },
   stripeConnectedAccountId: { type: String, default: '' },
   stripeExternalAccountId: { type: String, default: '' },
+  stripeCustomerId: { type: String, default: '' },
+  stripeProSubscriptionId: { type: String, default: '' },
+  stripeProSubscriptionStatus: { type: String, default: '' },
+  stripeProCurrentPeriodEnd: { type: Date },
   stripePayoutReady: { type: Boolean, default: false },
   stripePayoutStatus: { type: String, default: 'not_configured' },
   stripeLastTransferId: { type: String, default: '' },
@@ -192,6 +222,43 @@ const PurchaseSchema = new mongoose.Schema({
 });
 PurchaseSchema.index({ pickId: 1, buyerId: 1 }, { unique: true });
 const Purchase = mongoose.model('Purchase', PurchaseSchema);
+const PaymentLedgerSchema = new mongoose.Schema({
+  flow: { type: String, default: '' },
+  status: { type: String, default: '' },
+  source: { type: String, default: '' },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  pickId: { type: mongoose.Schema.Types.ObjectId, ref: 'Pick' },
+  stripeEventId: { type: String, default: '' },
+  stripeSessionId: { type: String, default: '' },
+  stripePaymentIntentId: { type: String, default: '' },
+  stripeCustomerId: { type: String, default: '' },
+  stripeSubscriptionId: { type: String, default: '' },
+  amountCents: { type: Number, default: 0 },
+  currency: { type: String, default: 'usd' },
+  metadata: { type: mongoose.Schema.Types.Mixed },
+  notes: { type: String, default: '' },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+}, { strict: false });
+PaymentLedgerSchema.index({ stripeSessionId: 1 }, { unique: true, sparse: true });
+PaymentLedgerSchema.index({ stripeEventId: 1 }, { sparse: true });
+PaymentLedgerSchema.index({ flow: 1, userId: 1, createdAt: -1 });
+const PaymentLedger = mongoose.model('PaymentLedger', PaymentLedgerSchema);
+
+const StripeWebhookEventSchema = new mongoose.Schema({
+  eventId: { type: String, required: true },
+  eventType: { type: String, default: '' },
+  status: { type: String, default: 'processing' },
+  flow: { type: String, default: '' },
+  details: { type: String, default: '' },
+  payload: { type: mongoose.Schema.Types.Mixed },
+  errorMessage: { type: String, default: '' },
+  processedAt: { type: Date },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+}, { strict: false });
+StripeWebhookEventSchema.index({ eventId: 1 }, { unique: true });
+const StripeWebhookEvent = mongoose.model('StripeWebhookEvent', StripeWebhookEventSchema);
 
 const WeeklyTipsterPayoutSchema = new mongoose.Schema({
   tipsterId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -347,6 +414,11 @@ const AUTO_CLOSE_MIN_EVENT_MATCH_QUALITY = Number.isFinite(Number(process.env.AU
 const AUTO_CLOSE_MIN_OFFICIAL_DATA_QUALITY = Number.isFinite(Number(process.env.AUTO_CLOSE_MIN_OFFICIAL_DATA_QUALITY))
   ? Math.max(0, Math.min(100, Number(process.env.AUTO_CLOSE_MIN_OFFICIAL_DATA_QUALITY)))
   : 70;
+const PICK_AI_MANUAL_AUTH_ONLY = (() => {
+  const raw = String(process.env.PICK_AI_MANUAL_AUTH_ONLY || 'false').trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(raw)) return true;
+  return false;
+})();
 
 const DEFAULT_PENDING_STALE_HOURS = Number.isFinite(Number(process.env.PICK_PENDING_STALE_HOURS))
   ? Math.max(1, Math.min(720, Number(process.env.PICK_PENDING_STALE_HOURS)))
@@ -2115,8 +2187,24 @@ app.post('/api/picks/:id/download', auth, async (req, res) => {
       { $inc: { downloadCount: 1 } },
       { new: true, projection: { ticketImg: 1, downloadCount: 1 } }
     );
-
-    res.json({ success: true, ticketImg: updatedPick?.ticketImg || pick.ticketImg, downloadCount: updatedPick?.downloadCount || 0 });
+    const finalDownloadCount = Number(updatedPick?.downloadCount || 0);
+    const sourceTicketImg = updatedPick?.ticketImg || pick.ticketImg;
+    const ticketImg = buildWatermarkedTicketDataUrl({
+      ticketImg: sourceTicketImg,
+      pick,
+      userId: req.user.id,
+      downloadCount: finalDownloadCount
+    });
+    res.json({
+      success: true,
+      ticketImg,
+      downloadCount: finalDownloadCount,
+      ticketProtection: {
+        watermark: true,
+        screenshotBlockingGuaranteed: false,
+        note: 'El backend aplica marca de agua dinámica; bloqueo total de screenshot depende del dispositivo/app cliente.'
+      }
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -3319,12 +3407,14 @@ async function analyzePickImageAndPersist(pick) {
   if (!pickDoc) throw new Error('pick_not_found');
   const analysis = await analyzePickImage(pickDoc);
   const mappedResult = mapAiOutcomeToPickResult(analysis?.resultado);
-  const shouldApprove = Boolean(mappedResult && Number(analysis?.confianza || 0) >= 85);
+  const autoCloseEnabled = !PICK_AI_MANUAL_AUTH_ONLY;
+  const shouldApprove = Boolean(autoCloseEnabled && mappedResult && Number(analysis?.confianza || 0) >= 85);
   const aiAnalysis = {
     resultado: analysis?.resultado || 'NECESITA_VERIFICACION',
     confianza: clampNumber(analysis?.confianza ?? 0, 0, 100, 0),
     detalle: toSafeString(analysis?.detalle || 'Sin detalle'),
     source: 'google-vision+odds-api+claude',
+    adminClosureRequired: true,
     needsReview: Boolean(analysis?.needsReview ?? !shouldApprove),
     ocr: {
       status: toSafeString(analysis?.ocr?.status) || 'failed',
@@ -3340,11 +3430,13 @@ async function analyzePickImageAndPersist(pick) {
       completed: Boolean(analysis.officialScore.completed)
     } : null
   };
-  const verificationStatus = shouldApprove
-    ? 'closed_auto'
-    : aiAnalysis.resultado === 'PENDIENTE'
+  const verificationStatus = aiAnalysis.resultado === 'PENDIENTE'
       ? 'pending_data'
-      : 'needs_review';
+      : aiAnalysis.needsReview
+        ? 'needs_review'
+        : shouldApprove
+          ? 'closed_auto'
+          : 'preliminary_ready';
   const verification = {
     ...(pickDoc?.verification || {}),
     status: verificationStatus,
@@ -4873,7 +4965,7 @@ async function analyzeAndPersistPick(pick, options = {}) {
     minOfficialDataQuality: AUTO_CLOSE_MIN_OFFICIAL_DATA_QUALITY,
     thresholdConfig: AUTO_CLOSE_THRESHOLD_CONFIG
   });
-  const shouldAutoClose = Boolean(autoCloseDecision?.shouldAutoClose);
+  const shouldAutoClose = Boolean(!PICK_AI_MANUAL_AUTH_ONLY && autoCloseDecision?.shouldAutoClose);
 
   if (shouldAutoClose) {
     computed.verification = {
@@ -4971,7 +5063,9 @@ async function runPickAnalysis(options = {}) {
   const batchLimit = Number.isFinite(Number(PICK_ANALYSIS_BATCH_LIMIT))
     ? Math.max(1, Number(PICK_ANALYSIS_BATCH_LIMIT))
     : 200;
-  const picks = await Pick.find(query).sort({ createdAt: 1 }).limit(batchLimit);
+  const picks = await Pick.find(query)
+    .sort({ 'verification.lastAnalyzedAt': 1, createdAt: 1 })
+    .limit(batchLimit);
   const summary = { total: picks.length, analyzed: 0, failed: 0, pending: 0, autoClosed: 0, results: [] };
   for (const pick of picks) {
     try {
@@ -4994,7 +5088,7 @@ async function runPickAnalysis(options = {}) {
 }
 const PICK_ANALYSIS_INTERVAL_MS = Number.isFinite(Number(process.env.PICK_ANALYSIS_INTERVAL_MS))
   ? Math.max(60_000, Number(process.env.PICK_ANALYSIS_INTERVAL_MS))
-  : 60 * 60 * 1000;
+  : 5 * 60 * 1000;
 const PICK_ANALYSIS_RECHECK_MINUTES = Number.isFinite(Number(process.env.PICK_ANALYSIS_RECHECK_MINUTES))
   ? Math.max(1, Number(process.env.PICK_ANALYSIS_RECHECK_MINUTES))
   : 30;
@@ -5006,21 +5100,18 @@ const PICK_ANALYSIS_BATCH_LIMIT = Number.isFinite(Number(process.env.PICK_ANALYS
   : 200;
 
 setTimeout(() => {
-  runPendingImagePickAnalysis({ limit: PICK_ANALYSIS_BATCH_LIMIT })
-    .catch((error) => console.error('initial runPendingImagePickAnalysis error:', error.message || error));
+  runPickAnalysis()
+    .catch((error) => console.error('initial runPickAnalysis error:', error.message || error));
 }, 15_000);
 
 setInterval(() => {
-  runPendingImagePickAnalysis({ limit: PICK_ANALYSIS_BATCH_LIMIT })
-    .catch((error) => console.error('runPendingImagePickAnalysis error:', error.message || error));
+  runPickAnalysis()
+    .catch((error) => console.error('runPickAnalysis error:', error.message || error));
 }, PICK_ANALYSIS_INTERVAL_MS);
 
 app.post('/api/admin/analyze-picks', auth, requireAdmin, async (req, res) => {
   try {
-    const limit = Number.isFinite(Number(req.body?.limit ?? req.query.limit))
-      ? Math.max(1, Math.min(300, Number(req.body?.limit ?? req.query.limit)))
-      : PICK_ANALYSIS_BATCH_LIMIT;
-    const summary = await runPendingImagePickAnalysis({ limit });
+    const summary = await runPickAnalysis({ includeRecent: true, forceOcr: true });
     res.json({ success: true, ...summary });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -5072,7 +5163,11 @@ const resolveCheckoutPaymentState = async (session) => {
       paymentIntentStatus = session.payment_intent?.status || null;
     }
   }
-  const isPaid = session?.payment_status === 'paid' || paymentIntentStatus === 'succeeded';
+  const isPaid = (
+    session?.payment_status === 'paid' ||
+    session?.payment_status === 'no_payment_required' ||
+    paymentIntentStatus === 'succeeded'
+  );
   return {
     isPaid,
     paymentStatus: session?.payment_status || null,
@@ -5131,6 +5226,613 @@ const getPickAccessState = async (pick, userId, userRole) => {
     isAdmin
   };
 };
+const SVG_WATERMARK_WIDTH = 1600;
+const SVG_WATERMARK_HEIGHT = 900;
+const SVG_WATERMARK_DIAGONAL_STEP = 320;
+
+const buildTicketWatermarkToken = ({ pickId, userId, downloadCount }) => {
+  const payload = `${toSafeString(pickId)}|${toSafeString(userId)}|${Number(downloadCount || 0)}|${new Date().toISOString().slice(0, 10)}`;
+  return crypto.createHash('sha256').update(payload).digest('hex').slice(0, 18).toUpperCase();
+};
+const buildTicketWatermarkSvg = ({ pick, userId, downloadCount }) => {
+  const safeTipster = escapeXml(toSafeString(pick?.tipster || 'TPZ'));
+  const safePickId = escapeXml(toSafeString(pick?._id || ''));
+  const safeUserId = escapeXml(toSafeString(userId || ''));
+  const token = buildTicketWatermarkToken({ pickId: safePickId, userId: safeUserId, downloadCount });
+  const stamp = `${safeTipster} · USER ${safeUserId.slice(-8) || 'NA'} · PICK ${safePickId.slice(-8) || 'NA'} · DL ${Number(downloadCount || 0)} · ${token}`;
+  const text = escapeXml(stamp);
+  let repeatedRows = '';
+  for (let x = -SVG_WATERMARK_WIDTH; x <= SVG_WATERMARK_WIDTH; x += SVG_WATERMARK_DIAGONAL_STEP) {
+    repeatedRows += `<text x="${x}" y="${Math.floor(SVG_WATERMARK_HEIGHT / 2)}">${text}</text>`;
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${SVG_WATERMARK_WIDTH}" height="${SVG_WATERMARK_HEIGHT}" viewBox="0 0 ${SVG_WATERMARK_WIDTH} ${SVG_WATERMARK_HEIGHT}">
+  <defs>
+    <style><![CDATA[
+      .wm {
+        fill: rgba(255,255,255,0.28);
+        font-family: Arial, sans-serif;
+        font-size: 32px;
+        letter-spacing: 1px;
+        font-weight: 700;
+      }
+    ]]></style>
+  </defs>
+  <g transform="rotate(-28 ${Math.floor(SVG_WATERMARK_WIDTH / 2)} ${Math.floor(SVG_WATERMARK_HEIGHT / 2)})" class="wm">
+    ${repeatedRows}
+  </g>
+</svg>`;
+};
+const buildWatermarkedTicketDataUrl = ({ ticketImg, pick, userId, downloadCount }) => {
+  const baseImage = String(ticketImg || '').trim();
+  if (!baseImage || !baseImage.startsWith('data:image/')) return baseImage;
+  const watermarkSvg = buildTicketWatermarkSvg({ pick, userId, downloadCount });
+  const watermarkBase64 = Buffer.from(watermarkSvg, 'utf8').toString('base64');
+  const watermarkUrl = `data:image/svg+xml;base64,${watermarkBase64}`;
+  const html = `<svg xmlns="http://www.w3.org/2000/svg" width="${SVG_WATERMARK_WIDTH}" height="${SVG_WATERMARK_HEIGHT}" viewBox="0 0 ${SVG_WATERMARK_WIDTH} ${SVG_WATERMARK_HEIGHT}">
+<rect width="100%" height="100%" fill="transparent"/>
+<image href="${baseImage}" x="0" y="0" width="100%" height="100%" preserveAspectRatio="xMidYMid meet"/>
+<image href="${watermarkUrl}" x="0" y="0" width="100%" height="100%" preserveAspectRatio="none"/>
+</svg>`;
+  const encoded = Buffer.from(html, 'utf8').toString('base64');
+  return `data:image/svg+xml;base64,${encoded}`;
+};
+
+const toObjectIdOrNull = (value) => {
+  const normalized = String(value || '').trim();
+  if (!normalized || !mongoose.Types.ObjectId.isValid(normalized)) return null;
+  return new mongoose.Types.ObjectId(normalized);
+};
+
+const resolveStripeObjectId = (value) => {
+  if (!value) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'object' && typeof value.id === 'string') return value.id.trim();
+  return '';
+};
+
+const resolveCheckoutSessionFlow = (session) => {
+  return toSafeString(session?.metadata?.flow).toLowerCase();
+};
+
+const resolveCheckoutSessionUserId = async (session) => {
+  const metadataUserId = toSafeString(session?.metadata?.userId);
+  if (mongoose.Types.ObjectId.isValid(metadataUserId)) return metadataUserId;
+  const email = toSafeString(session?.customer_details?.email || session?.customer_email).toLowerCase();
+  if (!email) return '';
+  const user = await User.findOne({ email }).select('_id');
+  return user ? String(user._id) : '';
+};
+
+const resolveCheckoutSessionPickId = (session) => {
+  const pickId = toSafeString(session?.metadata?.pickId);
+  return mongoose.Types.ObjectId.isValid(pickId) ? pickId : '';
+};
+
+const resolveCheckoutSessionAmountCents = (session, fallback = 0) => {
+  const amount = Number(session?.amount_total);
+  if (!Number.isFinite(amount) || amount <= 0) return Number(fallback) > 0 ? Number(fallback) : 0;
+  return Math.floor(amount);
+};
+
+const resolveCheckoutSessionCurrency = (session) => {
+  const currency = toSafeString(session?.currency || 'usd').toLowerCase();
+  return currency || 'usd';
+};
+
+const resolveCheckoutSessionPaymentIntentId = (session) => {
+  return resolveStripeObjectId(session?.payment_intent);
+};
+
+const resolveCheckoutSessionCustomerId = (session) => {
+  return resolveStripeObjectId(session?.customer);
+};
+
+const resolveCheckoutSessionSubscriptionId = (session) => {
+  return resolveStripeObjectId(session?.subscription);
+};
+
+const resolveCheckoutLedgerMetadata = (session) => {
+  return {
+    mode: toSafeString(session?.mode),
+    paymentStatus: toSafeString(session?.payment_status),
+    checkoutStatus: toSafeString(session?.status)
+  };
+};
+
+const resolveProExpiryFromContext = ({ currentExpiry, explicitExpiryDate = null }) => {
+  const now = new Date();
+  const parsedExplicit = explicitExpiryDate instanceof Date && !Number.isNaN(explicitExpiryDate.getTime())
+    ? explicitExpiryDate
+    : null;
+  if (parsedExplicit && parsedExplicit > now) return parsedExplicit;
+  const parsedCurrent = currentExpiry instanceof Date && !Number.isNaN(currentExpiry.getTime())
+    ? currentExpiry
+    : null;
+  const baseDate = parsedCurrent && parsedCurrent > now ? parsedCurrent : now;
+  return new Date(baseDate.getTime() + PRO_PLAN_DURATION_DAYS * 24 * 60 * 60 * 1000);
+};
+
+const upsertSessionPaymentLedger = async (session, payload = {}) => {
+  const stripeSessionId = toSafeString(session?.id);
+  if (!stripeSessionId) return null;
+  const flow = toSafeString(payload.flow || resolveCheckoutSessionFlow(session) || 'unknown').toLowerCase();
+  const userId = toObjectIdOrNull(payload.userId || session?.metadata?.userId);
+  const pickId = toObjectIdOrNull(payload.pickId || session?.metadata?.pickId);
+  const stripeEventId = toSafeString(payload.stripeEventId);
+  const stripePaymentIntentId = toSafeString(payload.stripePaymentIntentId || resolveCheckoutSessionPaymentIntentId(session));
+  const stripeCustomerId = toSafeString(payload.stripeCustomerId || resolveCheckoutSessionCustomerId(session));
+  const stripeSubscriptionId = toSafeString(payload.stripeSubscriptionId || resolveCheckoutSessionSubscriptionId(session));
+  const amountCents = Number.isFinite(Number(payload.amountCents))
+    ? Number(payload.amountCents)
+    : resolveCheckoutSessionAmountCents(session, 0);
+  const currency = toSafeString(payload.currency || resolveCheckoutSessionCurrency(session) || 'usd').toLowerCase();
+  const now = new Date();
+  const metadata = {
+    ...resolveCheckoutLedgerMetadata(session),
+    ...(payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {})
+  };
+  await PaymentLedger.updateOne(
+    { stripeSessionId },
+    {
+      $set: {
+        flow,
+        status: toSafeString(payload.status || 'pending').toLowerCase(),
+        source: toSafeString(payload.source || ''),
+        userId,
+        pickId,
+        stripeEventId,
+        stripeSessionId,
+        stripePaymentIntentId,
+        stripeCustomerId,
+        stripeSubscriptionId,
+        amountCents: Math.max(0, Number(amountCents) || 0),
+        currency: currency || 'usd',
+        metadata,
+        notes: toSafeString(payload.notes || ''),
+        updatedAt: now
+      },
+      $setOnInsert: { createdAt: now }
+    },
+    { upsert: true }
+  );
+  return PaymentLedger.findOne({ stripeSessionId });
+};
+
+const upsertEventPaymentLedger = async (payload = {}) => {
+  const stripeEventId = toSafeString(payload.stripeEventId);
+  if (!stripeEventId) return null;
+  const now = new Date();
+  await PaymentLedger.updateOne(
+    { stripeEventId },
+    {
+      $set: {
+        flow: toSafeString(payload.flow || 'unknown').toLowerCase(),
+        status: toSafeString(payload.status || 'pending').toLowerCase(),
+        source: toSafeString(payload.source || ''),
+        userId: toObjectIdOrNull(payload.userId),
+        pickId: toObjectIdOrNull(payload.pickId),
+        stripeEventId,
+        stripeSessionId: toSafeString(payload.stripeSessionId),
+        stripePaymentIntentId: toSafeString(payload.stripePaymentIntentId),
+        stripeCustomerId: toSafeString(payload.stripeCustomerId),
+        stripeSubscriptionId: toSafeString(payload.stripeSubscriptionId),
+        amountCents: Math.max(0, Number(payload.amountCents) || 0),
+        currency: toSafeString(payload.currency || 'usd').toLowerCase() || 'usd',
+        metadata: payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {},
+        notes: toSafeString(payload.notes || ''),
+        updatedAt: now
+      },
+      $setOnInsert: { createdAt: now }
+    },
+    { upsert: true }
+  );
+  return PaymentLedger.findOne({ stripeEventId });
+};
+
+const grantProMembershipForUser = async ({
+  userId,
+  stripeCustomerId = '',
+  stripeSubscriptionId = '',
+  subscriptionStatus = '',
+  explicitExpiryDate = null
+}) => {
+  if (!mongoose.Types.ObjectId.isValid(String(userId || '').trim())) {
+    throw buildHttpError(400, 'Usuario inválido para activar membresía Pro');
+  }
+  const user = await User.findById(userId).select('role proExpiry');
+  if (!user) throw buildHttpError(404, 'Usuario no encontrado');
+  const proExpiry = resolveProExpiryFromContext({ currentExpiry: user.proExpiry, explicitExpiryDate });
+  const nextRole = ['admin', 'tipster'].includes(String(user.role || '').toLowerCase()) ? user.role : 'pro';
+  const updates = {
+    role: nextRole,
+    proExpiry,
+    stripeProSubscriptionStatus: toSafeString(subscriptionStatus || user?.stripeProSubscriptionStatus || '').toLowerCase()
+  };
+  if (stripeCustomerId) updates.stripeCustomerId = stripeCustomerId;
+  if (stripeSubscriptionId) updates.stripeProSubscriptionId = stripeSubscriptionId;
+  updates.stripeProCurrentPeriodEnd = proExpiry;
+  return User.findByIdAndUpdate(userId, updates, { new: true }).select('-password');
+};
+
+const downgradeProMembershipForUser = async ({
+  userId,
+  stripeCustomerId = '',
+  stripeSubscriptionId = '',
+  subscriptionStatus = 'canceled'
+}) => {
+  if (!mongoose.Types.ObjectId.isValid(String(userId || '').trim())) return null;
+  const user = await User.findById(userId).select('role proExpiry');
+  if (!user) return null;
+  const currentRole = String(user.role || '').toLowerCase();
+  const nextRole = currentRole === 'pro' ? 'basic' : user.role;
+  const updates = {
+    role: nextRole,
+    proExpiry: currentRole === 'pro' ? null : user.proExpiry,
+    stripeProSubscriptionStatus: toSafeString(subscriptionStatus).toLowerCase(),
+    stripeProCurrentPeriodEnd: null
+  };
+  if (stripeCustomerId) updates.stripeCustomerId = stripeCustomerId;
+  if (stripeSubscriptionId) updates.stripeProSubscriptionId = stripeSubscriptionId;
+  return User.findByIdAndUpdate(userId, updates, { new: true }).select('-password');
+};
+
+const processPickCheckoutPayment = async (session, options = {}) => {
+  const sessionUserId = await resolveCheckoutSessionUserId(session);
+  if (!sessionUserId) throw buildHttpError(400, 'La sesión no contiene usuario asociado');
+  const expectedUserId = toSafeString(options.expectedUserId);
+  if (expectedUserId && sessionUserId !== expectedUserId) {
+    throw buildHttpError(403, 'La sesión no pertenece al usuario autenticado');
+  }
+  const pickId = resolveCheckoutSessionPickId(session);
+  if (!pickId) throw buildHttpError(400, 'No se encontró pickId en la sesión');
+  const expectedPickId = toSafeString(options.expectedPickId);
+  if (expectedPickId && expectedPickId !== pickId) {
+    throw buildHttpError(400, 'pickId no coincide con la sesión de checkout');
+  }
+  const existingPick = await Pick.findById(pickId).select('_id');
+  if (!existingPick) throw buildHttpError(404, 'Pick not found');
+  const amountCents = resolveCheckoutSessionAmountCents(session, 0);
+  const currency = resolveCheckoutSessionCurrency(session);
+  const sessionId = toSafeString(session?.id);
+  const purchaseUpsertResult = await Purchase.updateOne(
+    { pickId, buyerId: sessionUserId },
+    {
+      $set: {
+        stripeSessionId: sessionId,
+        amountCents,
+        currency
+      },
+      $setOnInsert: { createdAt: new Date() }
+    },
+    { upsert: true }
+  );
+  const isFirstPaidPurchase = Number(purchaseUpsertResult?.upsertedCount || 0) > 0;
+  const authoritativeSalesCount = await Purchase.countDocuments({ pickId });
+  const updatedPick = await Pick.findByIdAndUpdate(
+    pickId,
+    {
+      $addToSet: { buyers: sessionUserId },
+      $set: { salesCount: authoritativeSalesCount }
+    },
+    { new: true }
+  );
+  if (!updatedPick) throw buildHttpError(404, 'Pick not found');
+  await upsertSessionPaymentLedger(session, {
+    flow: 'pick',
+    status: 'paid',
+    source: options.source || 'checkout',
+    stripeEventId: options.stripeEventId || '',
+    userId: sessionUserId,
+    pickId,
+    amountCents,
+    currency,
+    notes: isFirstPaidPurchase ? 'first_purchase' : 'purchase_already_registered'
+  });
+  return {
+    flow: 'pick',
+    userId: sessionUserId,
+    pickId,
+    pick: updatedPick,
+    isFirstPaidPurchase,
+    amountCents,
+    currency
+  };
+};
+
+const processProCheckoutPayment = async (session, options = {}) => {
+  const sessionUserId = await resolveCheckoutSessionUserId(session);
+  if (!sessionUserId) throw buildHttpError(400, 'La sesión no contiene usuario asociado');
+  const expectedUserId = toSafeString(options.expectedUserId);
+  if (expectedUserId && sessionUserId !== expectedUserId) {
+    throw buildHttpError(403, 'La sesión no pertenece al usuario autenticado');
+  }
+  const stripeCustomerId = resolveCheckoutSessionCustomerId(session);
+  const stripeSubscriptionId = resolveCheckoutSessionSubscriptionId(session);
+  const subscriptionStatus = stripeSubscriptionId ? 'active' : '';
+  const user = await grantProMembershipForUser({
+    userId: sessionUserId,
+    stripeCustomerId,
+    stripeSubscriptionId,
+    subscriptionStatus
+  });
+  const amountCents = resolveCheckoutSessionAmountCents(session, PRO_PLAN_AMOUNT_CENTS);
+  const currency = resolveCheckoutSessionCurrency(session);
+  await upsertSessionPaymentLedger(session, {
+    flow: 'pro',
+    status: 'paid',
+    source: options.source || 'checkout',
+    stripeEventId: options.stripeEventId || '',
+    userId: sessionUserId,
+    amountCents,
+    currency,
+    stripeCustomerId,
+    stripeSubscriptionId
+  });
+  return {
+    flow: 'pro',
+    userId: sessionUserId,
+    user,
+    proExpiry: user?.proExpiry || null,
+    amountCents,
+    currency,
+    stripeCustomerId,
+    stripeSubscriptionId
+  };
+};
+
+const processPaidCheckoutSession = async (session, options = {}) => {
+  const flow = resolveCheckoutSessionFlow(session);
+  if (!flow) throw buildHttpError(400, 'La sesión no contiene flow asociado');
+  const expectedFlow = toSafeString(options.expectedFlow).toLowerCase();
+  if (expectedFlow && flow !== expectedFlow) {
+    throw buildHttpError(400, `La sesión no corresponde a ${expectedFlow}`);
+  }
+  if (flow === 'pick') {
+    return processPickCheckoutPayment(session, options);
+  }
+  if (flow === 'pro') {
+    return processProCheckoutPayment(session, options);
+  }
+  throw buildHttpError(400, `Flow de checkout no soportado: ${flow}`);
+};
+
+const findUserByStripeIdentifiers = async ({ userId = '', stripeCustomerId = '', stripeSubscriptionId = '' }) => {
+  const normalizedUserId = toSafeString(userId);
+  if (mongoose.Types.ObjectId.isValid(normalizedUserId)) {
+    const byId = await User.findById(normalizedUserId).select('_id');
+    if (byId) return byId;
+  }
+  const orFilters = [];
+  if (stripeSubscriptionId) orFilters.push({ stripeProSubscriptionId: stripeSubscriptionId });
+  if (stripeCustomerId) orFilters.push({ stripeCustomerId });
+  if (!orFilters.length) return null;
+  return User.findOne({ $or: orFilters }).select('_id');
+};
+
+const processProSubscriptionLifecycle = async (subscription, options = {}) => {
+  const subscriptionId = resolveStripeObjectId(subscription?.id || subscription);
+  const customerId = resolveStripeObjectId(subscription?.customer);
+  const status = toSafeString(subscription?.status).toLowerCase();
+  const flow = toSafeString(subscription?.metadata?.flow).toLowerCase();
+  if (flow && flow !== 'pro') {
+    return { handled: false, flow, details: 'subscription_flow_not_supported' };
+  }
+  const explicitUserId = toSafeString(subscription?.metadata?.userId);
+  const user = await findUserByStripeIdentifiers({
+    userId: explicitUserId,
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscriptionId
+  });
+  if (!user) {
+    await upsertEventPaymentLedger({
+      flow: 'pro',
+      status: 'ignored',
+      source: options.source || 'webhook',
+      stripeEventId: options.stripeEventId || '',
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: subscriptionId,
+      notes: `subscription_user_not_found:${status}`
+    });
+    return { handled: false, flow: 'pro', details: 'subscription_user_not_found' };
+  }
+  const rawPeriodEnd = Number(subscription?.current_period_end);
+  const explicitExpiryDate = Number.isFinite(rawPeriodEnd) && rawPeriodEnd > 0
+    ? new Date(rawPeriodEnd * 1000)
+    : null;
+  const activeStatuses = new Set(['active', 'trialing', 'past_due']);
+  const inactiveStatuses = new Set(['canceled', 'incomplete_expired', 'unpaid']);
+  let userSnapshot = null;
+  let ledgerStatus = 'pending';
+  if (activeStatuses.has(status)) {
+    userSnapshot = await grantProMembershipForUser({
+      userId: String(user._id),
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: subscriptionId,
+      subscriptionStatus: status,
+      explicitExpiryDate
+    });
+    ledgerStatus = 'paid';
+  } else if (inactiveStatuses.has(status)) {
+    userSnapshot = await downgradeProMembershipForUser({
+      userId: String(user._id),
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: subscriptionId,
+      subscriptionStatus: status
+    });
+    ledgerStatus = 'canceled';
+  } else {
+    userSnapshot = await User.findByIdAndUpdate(
+      user._id,
+      {
+        stripeCustomerId: customerId || undefined,
+        stripeProSubscriptionId: subscriptionId || undefined,
+        stripeProSubscriptionStatus: status || undefined,
+        stripeProCurrentPeriodEnd: explicitExpiryDate || null
+      },
+      { new: true }
+    ).select('-password');
+    ledgerStatus = 'updated';
+  }
+  await upsertEventPaymentLedger({
+    flow: 'pro',
+    status: ledgerStatus,
+    source: options.source || 'webhook',
+    stripeEventId: options.stripeEventId || '',
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscriptionId,
+    userId: String(user._id),
+    metadata: {
+      subscriptionStatus: status,
+      periodEnd: explicitExpiryDate ? explicitExpiryDate.toISOString() : null
+    },
+    notes: `subscription_${status || 'unknown'}`
+  });
+  return {
+    handled: true,
+    flow: 'pro',
+    userId: String(user._id),
+    status,
+    proExpiry: userSnapshot?.proExpiry || null
+  };
+};
+
+const processStripeWebhookEvent = async (event) => {
+  const type = toSafeString(event?.type);
+  const stripeEventId = toSafeString(event?.id);
+  const payload = event?.data?.object || {};
+  if (!type) return { handled: false, flow: '', details: 'missing_event_type' };
+  if (type === 'checkout.session.completed' || type === 'checkout.session.async_payment_succeeded') {
+    const flow = resolveCheckoutSessionFlow(payload);
+    const paymentStatus = toSafeString(payload?.payment_status).toLowerCase();
+    const isSubscriptionSession = toSafeString(payload?.mode).toLowerCase() === 'subscription';
+    const paidLike = paymentStatus === 'paid' || type === 'checkout.session.async_payment_succeeded';
+    const allowNoPaymentForProSubscription = flow === 'pro' && isSubscriptionSession && paymentStatus === 'no_payment_required';
+    if (!paidLike && !allowNoPaymentForProSubscription) {
+      await upsertSessionPaymentLedger(payload, {
+        flow: flow || 'unknown',
+        status: 'pending',
+        source: `webhook:${type}`,
+        stripeEventId,
+        notes: `checkout_not_paid:${paymentStatus || 'unknown'}`
+      });
+      return { handled: false, flow, details: 'checkout_not_paid' };
+    }
+    const processed = await processPaidCheckoutSession(payload, {
+      source: `webhook:${type}`,
+      stripeEventId
+    });
+    return { handled: true, flow: processed?.flow || flow, details: type };
+  }
+  if (type === 'checkout.session.expired' || type === 'checkout.session.async_payment_failed') {
+    const flow = resolveCheckoutSessionFlow(payload);
+    await upsertSessionPaymentLedger(payload, {
+      flow: flow || 'unknown',
+      status: type === 'checkout.session.expired' ? 'expired' : 'failed',
+      source: `webhook:${type}`,
+      stripeEventId,
+      notes: `checkout_${type.split('.').pop()}`
+    });
+    return { handled: true, flow, details: type };
+  }
+  if (type === 'customer.subscription.created' || type === 'customer.subscription.updated' || type === 'customer.subscription.deleted') {
+    const processed = await processProSubscriptionLifecycle(payload, {
+      source: `webhook:${type}`,
+      stripeEventId
+    });
+    return {
+      handled: Boolean(processed?.handled),
+      flow: processed?.flow || 'pro',
+      details: processed?.details || type
+    };
+  }
+  return { handled: false, flow: '', details: 'event_not_handled' };
+};
+
+app.post(STRIPE_WEBHOOK_PATH, async (req, res) => {
+  if (!STRIPE_WEBHOOK_SECRET) {
+    return res.status(503).json({ error: 'Stripe webhook no configurado: falta STRIPE_WEBHOOK_SECRET' });
+  }
+  const signatureHeader = req.headers['stripe-signature'];
+  const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : toSafeString(signatureHeader);
+  if (!signature) {
+    return res.status(400).json({ error: 'Falta header stripe-signature' });
+  }
+  const payloadBuffer = Buffer.isBuffer(req.rawBody)
+    ? req.rawBody
+    : Buffer.from(JSON.stringify(req.body || {}));
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(payloadBuffer, signature, STRIPE_WEBHOOK_SECRET);
+  } catch (error) {
+    return res.status(400).json({ error: `Firma webhook inválida: ${error.message}` });
+  }
+  const eventId = toSafeString(event?.id);
+  const eventType = toSafeString(event?.type);
+  if (!eventId) return res.status(400).json({ error: 'Evento Stripe inválido: id faltante' });
+  let eventRecord = await StripeWebhookEvent.findOne({ eventId });
+  if (eventRecord?.status === 'processed' || eventRecord?.status === 'ignored') {
+    return res.json({ received: true, duplicate: true, eventId, eventType, status: eventRecord.status });
+  }
+  if (!eventRecord) {
+    try {
+      eventRecord = await StripeWebhookEvent.create({
+        eventId,
+        eventType,
+        status: 'processing',
+        payload: {
+          livemode: Boolean(event?.livemode),
+          object: toSafeString(event?.data?.object?.object),
+          created: Number(event?.created || 0)
+        },
+        updatedAt: new Date()
+      });
+    } catch (error) {
+      if (error?.code === 11000) {
+        eventRecord = await StripeWebhookEvent.findOne({ eventId });
+        if (eventRecord?.status === 'processed' || eventRecord?.status === 'ignored') {
+          return res.json({ received: true, duplicate: true, eventId, eventType, status: eventRecord.status });
+        }
+      } else {
+        return res.status(500).json({ error: 'No se pudo registrar webhook Stripe' });
+      }
+    }
+  } else {
+    await StripeWebhookEvent.updateOne(
+      { _id: eventRecord._id },
+      { $set: { status: 'processing', updatedAt: new Date(), errorMessage: '' } }
+    );
+  }
+  try {
+    const processed = await processStripeWebhookEvent(event);
+    const finalStatus = processed?.handled ? 'processed' : 'ignored';
+    await StripeWebhookEvent.updateOne(
+      { eventId },
+      {
+        $set: {
+          status: finalStatus,
+          flow: toSafeString(processed?.flow || '').toLowerCase(),
+          details: toSafeString(processed?.details || ''),
+          processedAt: new Date(),
+          updatedAt: new Date()
+        }
+      }
+    );
+    return res.json({ received: true, eventId, eventType, status: finalStatus });
+  } catch (error) {
+    await StripeWebhookEvent.updateOne(
+      { eventId },
+      {
+        $set: {
+          status: 'failed',
+          errorMessage: toSafeString(error?.message || 'stripe_webhook_processing_failed').slice(0, 400),
+          updatedAt: new Date()
+        }
+      }
+    );
+    return res.status(500).json({ error: 'stripe_webhook_processing_failed' });
+  }
+});
 
 app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => {
   try {
@@ -5179,11 +5881,18 @@ app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => 
       pickId: String(pick._id)
     });
 
+    const pickCheckoutMetadata = {
+      flow: 'pick',
+      pickId: String(pick._id),
+      userId: String(req.user.id)
+    };
+
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       success_url: successUrl,
       cancel_url: cancelUrl,
       customer_email: user?.email || undefined,
+      client_reference_id: String(req.user.id),
       line_items: [{
         quantity: 1,
         price_data: {
@@ -5195,15 +5904,14 @@ app.post('/api/stripe/picks/create-checkout-session', auth, async (req, res) => 
           }
         }
       }],
-      metadata: {
-        flow: 'pick',
-        pickId: String(pick._id),
-        userId: String(req.user.id)
-      }
+      payment_intent_data: { metadata: pickCheckoutMetadata },
+      metadata: pickCheckoutMetadata
     });
 
     res.json({ success: true, sessionId: session.id, checkoutUrl: session.url });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) => {
@@ -5226,47 +5934,19 @@ app.post('/api/stripe/picks/confirm-checkout-session', auth, async (req, res) =>
         paymentIntentStatus: paymentState.paymentIntentStatus
       });
     }
-    if (session.metadata?.flow !== 'pick') return res.status(400).json({ error: 'La sesión no corresponde a compra de pick' });
 
-    if (!session.metadata?.userId) {
-      return res.status(400).json({ error: 'La sesión no contiene usuario asociado' });
-    }
-    if (String(session.metadata.userId) !== String(req.user.id)) {
-      return res.status(403).json({ error: 'La sesión no pertenece al usuario autenticado' });
-    }
-    const targetPickId = session.metadata?.pickId;
-    if (!targetPickId) return res.status(400).json({ error: 'No se encontró pickId en la sesión' });
-    if (pickId && String(pickId) !== String(targetPickId)) {
-      return res.status(400).json({ error: 'pickId no coincide con la sesión de checkout' });
-    }
+    const processed = await processPaidCheckoutSession(session, {
+      expectedFlow: 'pick',
+      expectedUserId: String(req.user.id),
+      expectedPickId: toSafeString(pickId),
+      source: 'confirm:picks'
+    });
 
-    const purchaseUpsertResult = await Purchase.updateOne(
-      { pickId: targetPickId, buyerId: req.user.id },
-      {
-        $set: {
-          stripeSessionId: normalizedSessionId,
-          amountCents: typeof session.amount_total === 'number' ? session.amount_total : 0,
-          currency: session.currency || 'usd'
-        },
-        $setOnInsert: { createdAt: new Date() }
-      },
-      { upsert: true }
-    );
-    const isFirstPaidPurchase = Number(purchaseUpsertResult?.upsertedCount || 0) > 0;
-    const pickUpdatePayload = { $addToSet: { buyers: req.user.id } };
-    if (isFirstPaidPurchase) {
-      pickUpdatePayload.$inc = { salesCount: 1 };
-    }
-
-    const updated = await Pick.findByIdAndUpdate(
-      targetPickId,
-      pickUpdatePayload,
-      { new: true }
-    );
-    if (!updated) return res.status(404).json({ error: 'Pick not found' });
-
-    res.json({ success: true, pick: updated });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    res.json({ success: true, pick: processed?.pick || null });
+  } catch (e) {
+    const statusCode = Number(e?.statusCode || 500);
+    res.status(statusCode).json({ error: e.message });
+  }
 });
 
 app.post('/api/stripe/pro/create-checkout-session', auth, async (req, res) => {
@@ -5286,12 +5966,26 @@ app.post('/api/stripe/pro/create-checkout-session', auth, async (req, res) => {
       flow: 'pro'
     });
 
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
+    const proCheckoutMetadata = {
+      flow: 'pro',
+      userId: String(req.user.id)
+    };
+
+    const sessionPayload = {
       success_url: successUrl,
       cancel_url: cancelUrl,
       customer_email: user?.email || undefined,
-      line_items: [{
+      client_reference_id: String(req.user.id),
+      metadata: proCheckoutMetadata
+    };
+
+    if (STRIPE_PRO_PRICE_ID) {
+      sessionPayload.mode = 'subscription';
+      sessionPayload.line_items = [{ price: STRIPE_PRO_PRICE_ID, quantity: 1 }];
+      sessionPayload.subscription_data = { metadata: proCheckoutMetadata };
+    } else {
+      sessionPayload.mode = 'payment';
+      sessionPayload.line_items = [{
         quantity: 1,
         price_data: {
           currency: 'usd',
@@ -5301,15 +5995,15 @@ app.post('/api/stripe/pro/create-checkout-session', auth, async (req, res) => {
             description: 'Membresía Pro mensual'
           }
         }
-      }],
-      metadata: {
-        flow: 'pro',
-        userId: String(req.user.id)
-      }
-    });
+      }];
+      sessionPayload.payment_intent_data = { metadata: proCheckoutMetadata };
+    }
 
+    const session = await stripe.checkout.sessions.create(sessionPayload);
     res.json({ success: true, sessionId: session.id, checkoutUrl: session.url });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/stripe/pro/confirm-checkout-session', auth, async (req, res) => {
@@ -5332,24 +6026,22 @@ app.post('/api/stripe/pro/confirm-checkout-session', auth, async (req, res) => {
         paymentIntentStatus: paymentState.paymentIntentStatus
       });
     }
-    if (session.metadata?.flow !== 'pro') return res.status(400).json({ error: 'La sesión no corresponde a membresía Pro' });
 
-    if (!session.metadata?.userId) {
-      return res.status(400).json({ error: 'La sesión no contiene usuario asociado' });
-    }
-    if (String(session.metadata.userId) !== String(req.user.id)) {
-      return res.status(403).json({ error: 'La sesión no pertenece al usuario autenticado' });
-    }
+    const processed = await processPaidCheckoutSession(session, {
+      expectedFlow: 'pro',
+      expectedUserId: String(req.user.id),
+      source: 'confirm:pro'
+    });
 
-    const proExpiry = new Date(Date.now() + PRO_PLAN_DURATION_DAYS * 24 * 60 * 60 * 1000);
-    const user = await User.findByIdAndUpdate(
-      req.user.id,
-      { role: 'pro', proExpiry },
-      { new: true }
-    ).select('-password');
-
-    res.json({ success: true, user, proExpiry });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    res.json({
+      success: true,
+      user: processed?.user || null,
+      proExpiry: processed?.proExpiry || null
+    });
+  } catch (e) {
+    const statusCode = Number(e?.statusCode || 500);
+    res.status(statusCode).json({ error: e.message });
+  }
 });
 app.post('/api/stripe/connect/create-onboarding-link', auth, async (req, res) => {
   try {
