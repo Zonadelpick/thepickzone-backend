@@ -2699,7 +2699,7 @@ app.post('/api/admin/picks/reanalyze-stale', auth, requireAdmin, async (req, res
     const summary = { total: stalePicks.length, analyzed: 0, failed: 0, autoClosed: 0, pending: 0, results: [] };
     for (const pick of stalePicks) {
       try {
-        const updated = await analyzePickImageAndPersist(pick);
+        const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
         summary.analyzed += 1;
         if (String(updated?.result || 'pending').toLowerCase() === 'pending') {
           summary.pending += 1;
@@ -2783,7 +2783,7 @@ app.post('/api/admin/picks/bulk-analyze', auth, requireAdmin, async (req, res) =
         continue;
       }
       try {
-        const updated = await analyzePickImageAndPersist(pick);
+        const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
         summary.analyzed += 1;
         if (String(updated?.result || 'pending').toLowerCase() === 'pending') {
           summary.pending += 1;
@@ -3526,6 +3526,23 @@ function buildBetFromPick(pickLike = {}) {
     sport: toSafeString(rawBet.sport || pickLike.sport)
   };
 }
+function normalizeBetSourceChain(...sourceValues) {
+  const parts = [];
+  const seen = new Set();
+  for (const rawValue of sourceValues) {
+    const tokens = String(rawValue || '')
+      .split('+')
+      .map((item) => String(item || '').trim().toLowerCase())
+      .filter(Boolean);
+    for (const token of tokens) {
+      if (seen.has(token)) continue;
+      seen.add(token);
+      parts.push(token);
+    }
+  }
+  if (!parts.length) return 'manual';
+  return parts.join('+');
+}
 
 function mergeBetData(baseBet, incomingBet = {}) {
   const merged = { ...(baseBet || {}) };
@@ -3538,9 +3555,7 @@ function mergeBetData(baseBet, incomingBet = {}) {
     if (incomingValue === undefined || incomingValue === null || incomingValue === '') continue;
     merged[key] = incomingValue;
   }
-  if (baseBet?.source && incomingBet?.source && baseBet.source !== incomingBet.source) {
-    merged.source = `${baseBet.source}+${incomingBet.source}`;
-  }
+  merged.source = normalizeBetSourceChain(baseBet?.source, merged?.source, incomingBet?.source);
   merged.marketType = normalizeMarketType(merged.marketType, merged.betType);
   merged.side = normalizeSide(merged.side || merged.selection);
   merged.statType = normalizeStatType(merged.statType || merged.marketKey);
@@ -5122,7 +5137,7 @@ app.post('/api/picks/:id/analyze', auth, requireAdmin, async (req, res) => {
   try {
     const pick = await findPickByIdentifier(req.params.id);
     if (!pick) return res.status(404).json({ error: 'Pick not found' });
-    const updated = await analyzePickImageAndPersist(pick);
+    const updated = await analyzeAndPersistPick(pick, { forceOcr: true });
     res.json({
       success: true,
       analysis: updated?.aiAnalysis || null,
