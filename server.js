@@ -2928,6 +2928,9 @@ const SOCCER_SCORE_FALLBACK_KEYS = [
   'soccer_france_ligue_one',
   'soccer_uefa_champs_league'
 ];
+const ODDS_SCORE_LOOKBACK_DAYS = Number.isFinite(Number(process.env.ODDS_SCORE_LOOKBACK_DAYS))
+  ? Math.max(1, Math.min(10, Number(process.env.ODDS_SCORE_LOOKBACK_DAYS)))
+  : 7;
 
 function toSafeString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -2974,11 +2977,20 @@ function scoreNameMatch(expected, candidate) {
   const c = normalizeTeamName(candidate);
   if (!e || !c) return 0;
   if (e === c) return 5;
+  const eCompact = e.replace(/\s+/g, '');
+  const cCompact = c.replace(/\s+/g, '');
+  if (eCompact && cCompact && eCompact === cCompact) return 5;
   if (c.includes(e) || e.includes(c)) return 4;
   const eParts = e.split(' ').filter(Boolean);
   const cParts = c.split(' ').filter(Boolean);
+  const eAcronym = eParts.length <= 1 ? eCompact : eParts.map((part) => part[0]).join('');
+  const cAcronym = cParts.length <= 1 ? cCompact : cParts.map((part) => part[0]).join('');
+  if (eAcronym && cAcronym && eAcronym.length >= 2 && cAcronym.length >= 2 && eAcronym === cAcronym) return 4;
+  if (eAcronym && eAcronym.length >= 2 && (cCompact === eAcronym || cCompact.startsWith(eAcronym))) return 4;
+  if (cAcronym && cAcronym.length >= 2 && (eCompact === cAcronym || eCompact.startsWith(cAcronym))) return 4;
   const overlap = eParts.filter((part) => cParts.includes(part)).length;
-  return overlap;
+  if (!overlap) return 0;
+  return Math.min(3, overlap + 1);
 }
 
 function resolveSportKeyFromContext({ sportKey, league, sport }) {
@@ -3021,7 +3033,7 @@ async function fetchScoreRowsBySportKey(sportKey) {
   const normalizedSportKey = toSafeString(sportKey);
   if (!normalizedSportKey || !process.env.ODDS_API_KEY) return [];
   try {
-    const url = `https://api.the-odds-api.com/v4/sports/${normalizedSportKey}/scores?apiKey=${process.env.ODDS_API_KEY}&daysFrom=4`;
+    const url = `https://api.the-odds-api.com/v4/sports/${normalizedSportKey}/scores?apiKey=${process.env.ODDS_API_KEY}&daysFrom=${ODDS_SCORE_LOOKBACK_DAYS}`;
     const resp = await axios.get(url, { timeout: 12000 });
     return Array.isArray(resp?.data) ? resp.data : [];
   } catch {
@@ -3048,6 +3060,24 @@ function resolveBestScoreRow(rows, { home, away, explicitEventId }) {
   }
   return { row: bestMatch, score: bestScore };
 }
+function resolveScoreEntryForTeam(scores, expectedTeamName) {
+  const rows = Array.isArray(scores) ? scores : [];
+  if (!rows.length) return null;
+  const expected = toSafeString(expectedTeamName);
+  if (!expected) return null;
+  const exact = rows.find((item) => toSafeString(item?.name) === expected);
+  if (exact) return exact;
+  let best = null;
+  let bestScore = 0;
+  for (const row of rows) {
+    const candidateScore = scoreNameMatch(expected, row?.name);
+    if (candidateScore > bestScore) {
+      best = row;
+      bestScore = candidateScore;
+    }
+  }
+  return bestScore >= 2 ? best : null;
+}
 function buildOfficialScoreFallbackKeys({ primarySportKey, league, sport, home, away }) {
   const keys = [];
   const primary = toSafeString(primarySportKey) || resolveSportKeyFromContext({ sportKey: primarySportKey, league, sport });
@@ -3071,10 +3101,10 @@ async function findCompletedOfficialScoreFallback({ league, sport, sportKey, hom
     const rows = await fetchScoreRowsBySportKey(candidateSportKey);
     if (!rows.length) continue;
     const { row, score } = resolveBestScoreRow(rows, { home, away, explicitEventId });
-    if (!row || score < 2) continue;
+    if (!row || score < 3) continue;
     const scores = Array.isArray(row.scores) ? row.scores : [];
-    const homeScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(row.home_team));
-    const awayScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(row.away_team));
+    const homeScoreEntry = resolveScoreEntryForTeam(scores, home || row.home_team);
+    const awayScoreEntry = resolveScoreEntryForTeam(scores, away || row.away_team);
     const homeScore = toSafeNumber(homeScoreEntry?.score);
     const awayScore = toSafeNumber(awayScoreEntry?.score);
     if (homeScore === null || awayScore === null) continue;
@@ -3088,7 +3118,8 @@ async function findCompletedOfficialScoreFallback({ league, sport, sportKey, hom
       completed: Boolean(row.completed),
       matchScore: score,
       commenceTime: toSafeString(row.commence_time),
-      raw: row
+      raw: row,
+      source: 'odds-api-fallback'
     };
     if (candidate.completed) return candidate;
     if (score > bestCandidateScore) {
@@ -3351,7 +3382,8 @@ async function analyzePickImage(pick) {
     homeTeam,
     awayTeam,
     baseBet?.sportKey || pick?.sportKey,
-    baseBet?.eventId || ''
+    baseBet?.eventId || '',
+    baseBet?.eventDate || pick?.time || ''
   );
   if (!officialScore?.completed) {
     const fallbackOfficialScore = await findCompletedOfficialScoreFallback({
@@ -4034,7 +4066,7 @@ async function resolveSoccerScoreWithApiSports({ league, home, away, eventDate, 
     source: 'api-sports-football'
   };
 }
-async function getMatchScore(league, home, away, explicitSportKey, explicitEventId = '') {
+async function getMatchScore(league, home, away, explicitSportKey, explicitEventId = '', eventDate = '') {
   try {
     const sportKey = explicitSportKey || resolveSportKeyFromContext({ sportKey: explicitSportKey, league, sport: '' });
     if (!sportKey || !process.env.ODDS_API_KEY) return null;
@@ -4060,7 +4092,7 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
           league,
           home,
           away,
-          eventDate: '',
+          eventDate,
           explicitEventId,
           fallbackSportKey: resolvedSportKey || sportKey
         });
@@ -4068,8 +4100,8 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
       return null;
     }
     const scores = Array.isArray(bestMatch.scores) ? bestMatch.scores : [];
-    const homeScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(bestMatch.home_team));
-    const awayScoreEntry = scores.find((item) => toSafeString(item?.name) === toSafeString(bestMatch.away_team));
+    const homeScoreEntry = resolveScoreEntryForTeam(scores, home || bestMatch.home_team);
+    const awayScoreEntry = resolveScoreEntryForTeam(scores, away || bestMatch.away_team);
     const resolvedScore = {
       eventId: toSafeString(bestMatch.id),
       sportKey: resolvedSportKey,
@@ -4090,7 +4122,7 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
         league,
         home,
         away,
-        eventDate: resolvedScore.commenceTime,
+        eventDate: eventDate || resolvedScore.commenceTime,
         explicitEventId,
         fallbackSportKey: resolvedScore.sportKey
       });
@@ -4878,13 +4910,26 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
     resolution = await resolvePropMarket(pick, mergedBet);
   } else {
     const [matchHome, matchAway] = splitMatchTeams(pick?.match);
+    const eventDate = mergedBet.eventDate || pick?.time || '';
     score = await getMatchScore(
       pick?.league,
       mergedBet.homeTeam || matchHome || '',
       mergedBet.awayTeam || matchAway || '',
       mergedBet.sportKey || pick?.sportKey,
-      mergedBet.eventId
+      mergedBet.eventId,
+      eventDate
     );
+    if (!score?.completed) {
+      const fallbackScore = await findCompletedOfficialScoreFallback({
+        league: pick?.league,
+        sport: pick?.sport || mergedBet?.sport,
+        sportKey: mergedBet.sportKey || pick?.sportKey,
+        home: mergedBet.homeTeam || matchHome || '',
+        away: mergedBet.awayTeam || matchAway || '',
+        explicitEventId: mergedBet.eventId || ''
+      });
+      if (fallbackScore) score = fallbackScore;
+    }
     resolution = resolveStandardMarket(mergedBet, score);
     const oddsSignal = await buildOddsSignalForStandardMarket({
       pick,
