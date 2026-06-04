@@ -2255,7 +2255,12 @@ const SPORT_KEYS = {
 const TEAM_LOGO_CACHE_TTL_MS = 1000 * 60 * 60 * 12;
 const teamLogoCache = new Map();
 const espnTeamsDirectoryCache = new Map();
+const espnScoreboardCache = new Map();
 const ESPN_TEAM_DIRECTORY_TTL_MS = 1000 * 60 * 60 * 6;
+const ESPN_SCOREBOARD_CACHE_TTL_MS = 1000 * 60 * 20;
+const ESPN_SCORE_FALLBACK_LOOKBACK_DAYS = Number.isFinite(Number(process.env.ESPN_SCORE_FALLBACK_LOOKBACK_DAYS))
+  ? Math.max(1, Math.min(14, Number(process.env.ESPN_SCORE_FALLBACK_LOOKBACK_DAYS)))
+  : 7;
 const ESPN_LEAGUE_PATH_BY_SPORT_KEY = {
   basketball_nba: 'basketball/nba',
   basketball_wnba: 'basketball/wnba',
@@ -2929,8 +2934,8 @@ const SOCCER_SCORE_FALLBACK_KEYS = [
   'soccer_uefa_champs_league'
 ];
 const ODDS_SCORE_LOOKBACK_DAYS = Number.isFinite(Number(process.env.ODDS_SCORE_LOOKBACK_DAYS))
-  ? Math.max(1, Math.min(10, Number(process.env.ODDS_SCORE_LOOKBACK_DAYS)))
-  : 7;
+  ? Math.max(1, Math.min(3, Number(process.env.ODDS_SCORE_LOOKBACK_DAYS)))
+  : 3;
 
 function toSafeString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -3029,11 +3034,132 @@ function buildSoccerScoreSearchKeys(primarySportKey, context = {}) {
   SOCCER_SCORE_FALLBACK_KEYS.forEach((sportKey) => keys.push(sportKey));
   return Array.from(new Set(keys.filter(Boolean)));
 }
-async function fetchScoreRowsBySportKey(sportKey) {
+function resolveOddsScoreDaysFrom(eventDate = '') {
+  const configured = clampNumber(ODDS_SCORE_LOOKBACK_DAYS, 1, 3, 3);
+  const parsedEventDate = new Date(eventDate);
+  if (Number.isNaN(parsedEventDate.getTime())) return configured;
+  const diffMs = Date.now() - parsedEventDate.getTime();
+  if (diffMs <= 0) return configured;
+  const diffDays = Math.ceil(diffMs / (24 * 60 * 60 * 1000));
+  return clampNumber(diffDays + 1, 1, 3, configured);
+}
+function buildEspnScoreboardCacheKey(sportKey = '', dateKey = '') {
+  return `${toSafeString(sportKey).toLowerCase()}::${toSafeString(dateKey)}`;
+}
+function readEspnScoreboardCache(cacheKey) {
+  const hit = espnScoreboardCache.get(cacheKey);
+  if (!hit) return null;
+  if ((Date.now() - Number(hit.at || 0)) > ESPN_SCOREBOARD_CACHE_TTL_MS) {
+    espnScoreboardCache.delete(cacheKey);
+    return null;
+  }
+  return Array.isArray(hit.events) ? hit.events : [];
+}
+function writeEspnScoreboardCache(cacheKey, events) {
+  espnScoreboardCache.set(cacheKey, {
+    events: Array.isArray(events) ? events : [],
+    at: Date.now()
+  });
+}
+function formatDateCompactYmd(dateLike) {
+  const ymd = formatDateYmd(dateLike);
+  return ymd ? ymd.replace(/-/g, '') : '';
+}
+function buildEspnScoreDateCandidates(eventDate = '') {
+  const normalizedEventDate = toSafeString(eventDate);
+  if (normalizedEventDate) {
+    const candidates = buildDateCandidates(normalizedEventDate);
+    const parsed = new Date(normalizedEventDate);
+    if (!Number.isNaN(parsed.getTime())) {
+      [-2, 2].forEach((offset) => {
+        const copy = new Date(parsed);
+        copy.setDate(copy.getDate() + offset);
+        candidates.push(formatDateYmd(copy));
+      });
+    }
+    return Array.from(new Set(
+      candidates
+        .map((candidate) => formatDateCompactYmd(candidate))
+        .filter((candidate) => candidate.length === 8)
+    ));
+  }
+  const fallbackDays = clampNumber(ESPN_SCORE_FALLBACK_LOOKBACK_DAYS, 1, 14, 7);
+  const candidates = [];
+  for (let offset = 0; offset <= fallbackDays; offset += 1) {
+    const copy = new Date();
+    copy.setDate(copy.getDate() - offset);
+    const compact = formatDateCompactYmd(copy);
+    if (compact) candidates.push(compact);
+  }
+  return Array.from(new Set(candidates.filter((candidate) => candidate.length === 8)));
+}
+async function fetchEspnScoreboardEvents(sportKey, dateKey) {
+  const normalizedSportKey = toSafeString(sportKey).toLowerCase();
+  const normalizedDateKey = String(dateKey || '').replace(/[^0-9]/g, '').slice(0, 8);
+  if (!normalizedSportKey || normalizedDateKey.length !== 8) return [];
+  const leaguePath = resolveEspnLeaguePathFromSportKey(normalizedSportKey);
+  if (!leaguePath) return [];
+  const cacheKey = buildEspnScoreboardCacheKey(normalizedSportKey, normalizedDateKey);
+  const cached = readEspnScoreboardCache(cacheKey);
+  if (cached) return cached;
+  try {
+    const url = `https://site.api.espn.com/apis/site/v2/sports/${leaguePath}/scoreboard?dates=${normalizedDateKey}`;
+    const resp = await axios.get(url, { timeout: 10000 });
+    const events = Array.isArray(resp?.data?.events) ? resp.data.events : [];
+    writeEspnScoreboardCache(cacheKey, events);
+    return events;
+  } catch {
+    return [];
+  }
+}
+function extractEspnCompetitorTeamName(competitor) {
+  return toSafeString(
+    competitor?.team?.displayName ||
+    competitor?.team?.name ||
+    competitor?.team?.shortDisplayName ||
+    competitor?.team?.abbreviation
+  );
+}
+function buildScoreCandidateFromEspnEvent(event, sportKey) {
+  const competition = Array.isArray(event?.competitions) ? event.competitions[0] : null;
+  const competitors = Array.isArray(competition?.competitors) ? competition.competitors : [];
+  if (!competitors.length) return null;
+  const homeCompetitor = competitors.find((item) => normalizeToken(item?.homeAway) === 'home') || competitors[0];
+  const awayCompetitor = competitors.find((item) => normalizeToken(item?.homeAway) === 'away') || competitors[1];
+  if (!homeCompetitor || !awayCompetitor) return null;
+  const homeTeam = extractEspnCompetitorTeamName(homeCompetitor);
+  const awayTeam = extractEspnCompetitorTeamName(awayCompetitor);
+  if (!homeTeam || !awayTeam) return null;
+  const statusType = competition?.status?.type || event?.status?.type || {};
+  const statusState = toSafeString(statusType?.state).toLowerCase();
+  const statusLabel = toSafeString(statusType?.shortDetail || statusType?.description || statusType?.name).toLowerCase();
+  const completed = Boolean(
+    statusType?.completed ||
+    statusState === 'post' ||
+    statusState === 'final' ||
+    statusLabel.includes('final') ||
+    statusLabel.includes('ft')
+  );
+  return {
+    eventId: toSafeString(event?.id || competition?.id),
+    sportKey: toSafeString(sportKey),
+    home: homeTeam,
+    away: awayTeam,
+    homeScore: toSafeNumber(homeCompetitor?.score),
+    awayScore: toSafeNumber(awayCompetitor?.score),
+    completed,
+    matchScore: 0,
+    commenceTime: toSafeString(event?.date || competition?.date),
+    raw: event,
+    source: 'espn-scoreboard-fallback'
+  };
+}
+async function fetchScoreRowsBySportKey(sportKey, eventDate = '') {
   const normalizedSportKey = toSafeString(sportKey);
   if (!normalizedSportKey || !process.env.ODDS_API_KEY) return [];
   try {
-    const url = `https://api.the-odds-api.com/v4/sports/${normalizedSportKey}/scores?apiKey=${process.env.ODDS_API_KEY}&daysFrom=${ODDS_SCORE_LOOKBACK_DAYS}`;
+    const daysFrom = resolveOddsScoreDaysFrom(eventDate);
+    const url = `https://api.the-odds-api.com/v4/sports/${normalizedSportKey}/scores?apiKey=${process.env.ODDS_API_KEY}&daysFrom=${daysFrom}&dateFormat=iso`;
     const resp = await axios.get(url, { timeout: 12000 });
     return Array.isArray(resp?.data) ? resp.data : [];
   } catch {
@@ -3093,12 +3219,50 @@ function buildOfficialScoreFallbackKeys({ primarySportKey, league, sport, home, 
   ].forEach((key) => keys.push(key));
   return Array.from(new Set(keys.filter(Boolean)));
 }
-async function findCompletedOfficialScoreFallback({ league, sport, sportKey, home, away, explicitEventId = '' }) {
+async function findCompletedOfficialScoreWithEspnFallback({
+  league,
+  sport,
+  sportKey,
+  home,
+  away,
+  explicitEventId = '',
+  eventDate = ''
+}) {
+  const fallbackKeys = buildOfficialScoreFallbackKeys({ primarySportKey: sportKey, league, sport, home, away });
+  const dateCandidates = buildEspnScoreDateCandidates(eventDate);
+  if (!fallbackKeys.length || !dateCandidates.length) return null;
+  const normalizedEventId = toSafeString(explicitEventId);
+  let bestCandidate = null;
+  let bestCandidateScore = -1;
+  for (const candidateSportKey of fallbackKeys) {
+    if (!resolveEspnLeaguePathFromSportKey(candidateSportKey)) continue;
+    for (const dateKey of dateCandidates) {
+      const events = await fetchEspnScoreboardEvents(candidateSportKey, dateKey);
+      for (const event of events) {
+        const candidate = buildScoreCandidateFromEspnEvent(event, candidateSportKey);
+        if (!candidate) continue;
+        const isExactEventId = normalizedEventId && candidate.eventId === normalizedEventId;
+        const matchScore = isExactEventId
+          ? 100
+          : scoreNameMatch(home, candidate.home) + scoreNameMatch(away, candidate.away);
+        if (!isExactEventId && matchScore < 3) continue;
+        candidate.matchScore = matchScore;
+        if (candidate.completed && candidate.homeScore !== null && candidate.awayScore !== null) return candidate;
+        if (matchScore > bestCandidateScore) {
+          bestCandidate = candidate;
+          bestCandidateScore = matchScore;
+        }
+      }
+    }
+  }
+  return bestCandidate;
+}
+async function findCompletedOfficialScoreFallback({ league, sport, sportKey, home, away, explicitEventId = '', eventDate = '' }) {
   const fallbackKeys = buildOfficialScoreFallbackKeys({ primarySportKey: sportKey, league, sport, home, away });
   let bestCandidate = null;
   let bestCandidateScore = -1;
   for (const candidateSportKey of fallbackKeys) {
-    const rows = await fetchScoreRowsBySportKey(candidateSportKey);
+    const rows = await fetchScoreRowsBySportKey(candidateSportKey, eventDate);
     if (!rows.length) continue;
     const { row, score } = resolveBestScoreRow(rows, { home, away, explicitEventId });
     if (!row || score < 3) continue;
@@ -3126,6 +3290,19 @@ async function findCompletedOfficialScoreFallback({ league, sport, sportKey, hom
       bestCandidate = candidate;
       bestCandidateScore = score;
     }
+  }
+  const espnCandidate = await findCompletedOfficialScoreWithEspnFallback({
+    league,
+    sport,
+    sportKey,
+    home,
+    away,
+    explicitEventId,
+    eventDate
+  });
+  if (espnCandidate) {
+    if (espnCandidate.completed && espnCandidate.homeScore !== null && espnCandidate.awayScore !== null) return espnCandidate;
+    if ((espnCandidate.matchScore || 0) > bestCandidateScore) return espnCandidate;
   }
   return bestCandidate;
 }
@@ -3392,7 +3569,8 @@ async function analyzePickImage(pick) {
       sportKey: baseBet?.sportKey || pick?.sportKey,
       home: homeTeam,
       away: awayTeam,
-      explicitEventId: baseBet?.eventId || ''
+      explicitEventId: baseBet?.eventId || '',
+      eventDate: baseBet?.eventDate || pick?.time || ''
     });
     if (fallbackOfficialScore) officialScore = fallbackOfficialScore;
   }
@@ -3644,7 +3822,12 @@ function resolveStandardMarket(bet, score) {
     };
   }
   const marketType = normalizeMarketType(bet?.marketType, bet?.betType);
-  const scoreProvider = toSafeString(score?.source) === 'api-sports-football' ? 'api-sports' : 'odds-api';
+  const scoreSource = toSafeString(score?.source);
+  const scoreProvider = scoreSource.startsWith('api-sports')
+    ? 'api-sports'
+    : scoreSource.startsWith('espn')
+      ? 'espn'
+      : 'odds-api';
   evidence.push({
     provider: scoreProvider,
     type: 'score',
@@ -4077,7 +4260,7 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
     let bestScore = -1;
     let resolvedSportKey = sportKey;
     for (const candidateSportKey of searchKeys) {
-      const rows = await fetchScoreRowsBySportKey(candidateSportKey);
+      const rows = await fetchScoreRowsBySportKey(candidateSportKey, eventDate);
       const candidate = resolveBestScoreRow(rows, { home, away, explicitEventId });
       if (candidate?.row && candidate.score > bestScore) {
         bestMatch = candidate.row;
@@ -4112,7 +4295,8 @@ async function getMatchScore(league, home, away, explicitSportKey, explicitEvent
       completed: Boolean(bestMatch.completed),
       matchScore: bestScore,
       commenceTime: toSafeString(bestMatch.commence_time),
-      raw: bestMatch
+      raw: bestMatch,
+      source: 'odds-api'
     };
     if (
       resolvedScore.sportKey.startsWith('soccer_') &&
@@ -4926,7 +5110,8 @@ async function buildPreliminaryAnalysisForPick(pick, options = {}) {
         sportKey: mergedBet.sportKey || pick?.sportKey,
         home: mergedBet.homeTeam || matchHome || '',
         away: mergedBet.awayTeam || matchAway || '',
-        explicitEventId: mergedBet.eventId || ''
+        explicitEventId: mergedBet.eventId || '',
+        eventDate
       });
       if (fallbackScore) score = fallbackScore;
     }
