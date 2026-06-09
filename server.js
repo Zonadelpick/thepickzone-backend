@@ -2540,6 +2540,80 @@ app.get('/api/tipsters', async (req, res) => {
     res.json(tipsters);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+app.get('/api/tipsters/:name/summary', async (req, res) => {
+  try {
+    const rawName = String(req.params?.name || '').trim();
+    if (!rawName) return res.status(400).json({ error: 'Nombre de tipster requerido' });
+    const decodedName = decodeURIComponent(rawName);
+    const escapedName = decodedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const tipster = await User.findOne({
+      role: { $in: ['pro', 'tipster', 'admin'] },
+      name: { $regex: `^${escapedName}$`, $options: 'i' }
+    }).select('name username avatar bio role roi yield roiValue yieldValue netUnits totalRiskedUnits winRate totalPicks wonPicks lostPicks pushPicks avgOdds');
+    if (!tipster) return res.status(404).json({ error: 'Tipster no encontrado' });
+
+    const tipsterName = String(tipster?.name || decodedName).trim();
+    const tipsterId = String(tipster?._id || '').trim();
+    const tipsterPickQuery = mongoose.Types.ObjectId.isValid(tipsterId)
+      ? { $or: [{ tipsterId }, { tipster: tipsterName }] }
+      : { tipster: tipsterName };
+    const tipsterPicks = await Pick.find(tipsterPickQuery)
+      .sort({ createdAt: -1 })
+      .select('-ticketImg');
+
+    const totals = tipsterPicks.reduce((acc, pickDoc) => {
+      const persistedSales = Number(pickDoc?.salesCount || 0);
+      const buyersSales = Array.isArray(pickDoc?.buyers) ? pickDoc.buyers.length : 0;
+      const salesCount = Math.max(0, persistedSales, buyersSales);
+      const priceUsd = Number(pickDoc?.price);
+      const safePriceUsd = Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : 0;
+      acc.salesCount += salesCount;
+      acc.grossUsd += salesCount * safePriceUsd;
+      return acc;
+    }, { salesCount: 0, grossUsd: 0 });
+    const grossUsd = Number(totals.grossUsd.toFixed(2));
+    const payoutUsd = Number((grossUsd * 0.9).toFixed(2));
+    const platformFeeUsd = Number((grossUsd - payoutUsd).toFixed(2));
+    const history = tipsterPicks.slice(0, 25).map((pickDoc) => {
+      const pick = pickDoc?.toObject ? pickDoc.toObject() : pickDoc;
+      const persistedSales = Number(pick?.salesCount || 0);
+      const buyersSales = Array.isArray(pick?.buyers) ? pick.buyers.length : 0;
+      return {
+        _id: pick?._id,
+        id: pick?.id,
+        match: pick?.match,
+        league: pick?.league,
+        sport: pick?.sport,
+        tipster: pick?.tipster,
+        odds: pick?.odds,
+        bank: pick?.bank,
+        price: pick?.price,
+        result: pick?.result,
+        betType: pick?.betType,
+        bet: pick?.bet || {},
+        time: pick?.time,
+        timeRaw: pick?.timeRaw,
+        createdAt: pick?.createdAt,
+        updatedAt: pick?.updatedAt,
+        salesCount: Math.max(0, persistedSales, buyersSales)
+      };
+    });
+
+    res.json({
+      success: true,
+      tipster,
+      earnings: {
+        salesCount: totals.salesCount,
+        grossUsd,
+        payoutUsd,
+        platformFeeUsd
+      },
+      history
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ── ADMIN ─────────────────────────────────────────────────────────────────────
 app.get('/api/admin/stats', auth, requireAdmin, async (req, res) => {
