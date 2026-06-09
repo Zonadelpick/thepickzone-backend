@@ -1039,6 +1039,177 @@ const resolveWeekRange = (weekOffset = 0) => {
   weekEnd.setUTCDate(weekEnd.getUTCDate() + 7);
   return { weekStart, weekEnd };
 };
+const DEFAULT_WEEKLY_FINANCE_WEEKS = 8;
+const MAX_WEEKLY_FINANCE_WEEKS = 24;
+const resolveWeeklyFinanceWeeks = (value, fallback = DEFAULT_WEEKLY_FINANCE_WEEKS) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(MAX_WEEKLY_FINANCE_WEEKS, Math.floor(parsed)));
+};
+const buildWeekLabel = (weekStart, weekEnd) => {
+  if (!(weekStart instanceof Date) || Number.isNaN(weekStart.getTime())) return '';
+  if (!(weekEnd instanceof Date) || Number.isNaN(weekEnd.getTime())) return '';
+  return `${weekStart.toLocaleDateString('es-MX')} - ${new Date(weekEnd.getTime() - 1).toLocaleDateString('es-MX')}`;
+};
+const resolveWeekStartFromDate = (dateValue) => {
+  const parsed = new Date(dateValue);
+  if (Number.isNaN(parsed.getTime())) return null;
+  const weekStart = new Date(Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate(), 0, 0, 0, 0));
+  const currentDay = weekStart.getUTCDay();
+  const deltaToMonday = currentDay === 0 ? -6 : 1 - currentDay;
+  weekStart.setUTCDate(weekStart.getUTCDate() + deltaToMonday);
+  return weekStart;
+};
+const buildTipsterPickQuery = (tipsterId, tipsterName) => {
+  const normalizedTipsterId = toSafeString(tipsterId);
+  const normalizedTipsterName = toSafeString(tipsterName);
+  if (mongoose.Types.ObjectId.isValid(normalizedTipsterId)) {
+    if (normalizedTipsterName) return { $or: [{ tipsterId: normalizedTipsterId }, { tipster: normalizedTipsterName }] };
+    return { tipsterId: normalizedTipsterId };
+  }
+  if (normalizedTipsterName) return { tipster: normalizedTipsterName };
+  return null;
+};
+const formatTipsterWeeklyCutRow = (payload = {}) => {
+  const grossCents = Math.max(0, Number(payload?.grossCents || 0));
+  const payoutCents = Math.max(0, Number(payload?.payoutCents || 0));
+  const platformFeeCents = Math.max(0, Number(payload?.platformFeeCents || 0));
+  const salesCount = Math.max(0, Number(payload?.salesCount || 0));
+  const status = toSafeString(payload?.status).toLowerCase() || (grossCents > 0 ? 'pending' : 'no_sales');
+  return {
+    weekStart: payload?.weekStart || null,
+    weekEnd: payload?.weekEnd || null,
+    label: toSafeString(payload?.label),
+    salesCount,
+    grossUsd: centsToAmount(grossCents),
+    payoutUsd: centsToAmount(payoutCents),
+    platformFeeUsd: centsToAmount(platformFeeCents),
+    status,
+    stripeTransferId: toSafeString(payload?.stripeTransferId),
+    approvedAt: payload?.approvedAt || null,
+    errorMessage: toSafeString(payload?.errorMessage)
+  };
+};
+async function buildTipsterWeeklyCutsSummary(tipsterDoc, options = {}) {
+  const normalizedWeeks = resolveWeeklyFinanceWeeks(options?.weeks, DEFAULT_WEEKLY_FINANCE_WEEKS);
+  const tipsterId = toSafeString(tipsterDoc?._id);
+  const tipsterName = toSafeString(tipsterDoc?.name);
+  const weekRanges = Array.from({ length: normalizedWeeks }, (_, index) => {
+    const { weekStart, weekEnd } = resolveWeekRange(index * -1);
+    return {
+      weekStart,
+      weekEnd,
+      weekKey: weekStart.toISOString(),
+      label: buildWeekLabel(weekStart, weekEnd)
+    };
+  });
+  if (!weekRanges.length) {
+    return {
+      weeks: normalizedWeeks,
+      currentWeek: null,
+      recentWeeks: [],
+      totals: { salesCount: 0, grossUsd: 0, payoutUsd: 0, platformFeeUsd: 0 }
+    };
+  }
+  const oldestWeekStart = weekRanges[weekRanges.length - 1].weekStart;
+  const newestWeekEnd = weekRanges[0].weekEnd;
+  const tipsterPickQuery = buildTipsterPickQuery(tipsterId, tipsterName);
+  const providedTipsterPicks = Array.isArray(options?.tipsterPicks) ? options.tipsterPicks : null;
+  const tipsterPicks = providedTipsterPicks || (
+    tipsterPickQuery
+      ? await Pick.find(tipsterPickQuery).select('_id tipsterId tipster price')
+      : []
+  );
+  const pickById = new Map(
+    (Array.isArray(tipsterPicks) ? tipsterPicks : [])
+      .map((pickDoc) => [String(pickDoc?._id || ''), pickDoc])
+      .filter(([pickId]) => Boolean(pickId))
+  );
+  const pickIds = Array.from(pickById.keys());
+  const weeklyRawTotals = new Map(weekRanges.map((range) => [range.weekKey, { grossCents: 0, salesCount: 0 }]));
+  if (pickIds.length > 0) {
+    const purchases = await Purchase.find({
+      pickId: { $in: pickIds },
+      createdAt: { $gte: oldestWeekStart, $lt: newestWeekEnd }
+    }).select('pickId amountCents currency createdAt');
+    purchases.forEach((purchaseDoc) => {
+      const currency = toSafeString(purchaseDoc?.currency || 'usd').toLowerCase();
+      if (currency && currency !== 'usd') return;
+      const weekStart = resolveWeekStartFromDate(purchaseDoc?.createdAt);
+      if (!weekStart) return;
+      const weekKey = weekStart.toISOString();
+      const bucket = weeklyRawTotals.get(weekKey);
+      if (!bucket) return;
+      const pickDoc = pickById.get(String(purchaseDoc?.pickId || ''));
+      const amountCents = Number(purchaseDoc?.amountCents) > 0
+        ? Number(purchaseDoc.amountCents)
+        : normalizeUsdCents(pickDoc?.price || 0);
+      if (!Number.isFinite(amountCents) || amountCents <= 0) return;
+      bucket.grossCents += amountCents;
+      bucket.salesCount += 1;
+    });
+  }
+  const payoutByWeekKey = new Map();
+  if (mongoose.Types.ObjectId.isValid(tipsterId)) {
+    const payoutRows = await WeeklyTipsterPayout.find({
+      tipsterId,
+      weekStart: { $gte: oldestWeekStart, $lt: newestWeekEnd }
+    }).select('weekStart weekEnd grossCents payoutCents platformFeeCents salesCount status stripeTransferId approvedAt errorMessage');
+    payoutRows.forEach((payoutDoc) => {
+      const weekStart = resolveWeekStartFromDate(payoutDoc?.weekStart);
+      if (!weekStart) return;
+      payoutByWeekKey.set(weekStart.toISOString(), payoutDoc);
+    });
+  }
+  const recentWeeks = weekRanges.map((range) => {
+    const rawTotals = weeklyRawTotals.get(range.weekKey) || { grossCents: 0, salesCount: 0 };
+    const payoutDoc = payoutByWeekKey.get(range.weekKey) || null;
+    const grossCents = Math.max(0, Math.max(Number(rawTotals?.grossCents || 0), Number(payoutDoc?.grossCents || 0)));
+    const salesCount = Math.max(0, Math.max(Number(rawTotals?.salesCount || 0), Number(payoutDoc?.salesCount || 0)));
+    const payoutCents = Number.isFinite(Number(payoutDoc?.payoutCents))
+      ? Math.max(0, Number(payoutDoc?.payoutCents || 0))
+      : Math.round(grossCents * 0.9);
+    const platformFeeCents = Number.isFinite(Number(payoutDoc?.platformFeeCents))
+      ? Math.max(0, Number(payoutDoc?.platformFeeCents || 0))
+      : Math.max(0, grossCents - payoutCents);
+    return formatTipsterWeeklyCutRow({
+      weekStart: range.weekStart,
+      weekEnd: range.weekEnd,
+      label: range.label,
+      grossCents,
+      payoutCents,
+      platformFeeCents,
+      salesCount,
+      status: toSafeString(payoutDoc?.status).toLowerCase() || (grossCents > 0 ? 'pending' : 'no_sales'),
+      stripeTransferId: payoutDoc?.stripeTransferId,
+      approvedAt: payoutDoc?.approvedAt || null,
+      errorMessage: payoutDoc?.errorMessage
+    });
+  });
+  const totals = recentWeeks.reduce((acc, row) => {
+    acc.salesCount += Number(row?.salesCount || 0);
+    acc.grossUsd += Number(row?.grossUsd || 0);
+    acc.payoutUsd += Number(row?.payoutUsd || 0);
+    acc.platformFeeUsd += Number(row?.platformFeeUsd || 0);
+    return acc;
+  }, {
+    salesCount: 0,
+    grossUsd: 0,
+    payoutUsd: 0,
+    platformFeeUsd: 0
+  });
+  return {
+    weeks: normalizedWeeks,
+    currentWeek: recentWeeks[0] || null,
+    recentWeeks,
+    totals: {
+      salesCount: totals.salesCount,
+      grossUsd: Number(totals.grossUsd.toFixed(2)),
+      payoutUsd: Number(totals.payoutUsd.toFixed(2)),
+      platformFeeUsd: Number(totals.platformFeeUsd.toFixed(2))
+    }
+  };
+}
 
 async function ensureTipsterStripeAccount(userDoc) {
   const existingAccountId = toSafeString(userDoc?.stripeConnectedAccountId);
@@ -2554,9 +2725,7 @@ app.get('/api/tipsters/:name/summary', async (req, res) => {
 
     const tipsterName = String(tipster?.name || decodedName).trim();
     const tipsterId = String(tipster?._id || '').trim();
-    const tipsterPickQuery = mongoose.Types.ObjectId.isValid(tipsterId)
-      ? { $or: [{ tipsterId }, { tipster: tipsterName }] }
-      : { tipster: tipsterName };
+    const tipsterPickQuery = buildTipsterPickQuery(tipsterId, tipsterName) || { tipster: tipsterName };
     const tipsterPicks = await Pick.find(tipsterPickQuery)
       .sort({ createdAt: -1 })
       .select('-ticketImg');
@@ -2598,6 +2767,10 @@ app.get('/api/tipsters/:name/summary', async (req, res) => {
         salesCount: Math.max(0, persistedSales, buyersSales)
       };
     });
+    const weeklyCuts = await buildTipsterWeeklyCutsSummary(tipster, {
+      weeks: req.query.weeks,
+      tipsterPicks
+    });
 
     res.json({
       success: true,
@@ -2608,7 +2781,35 @@ app.get('/api/tipsters/:name/summary', async (req, res) => {
         payoutUsd,
         platformFeeUsd
       },
+      weeklyCuts,
       history
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+app.get('/api/pro/finance/summary', auth, async (req, res) => {
+  try {
+    const currentUser = await User.findById(req.user.id).select('name role bankClabeMasked bankAccountHolder bankName stripePayoutReady stripePayoutStatus');
+    if (!currentUser) return res.status(404).json({ error: 'User not found' });
+    const normalizedRole = toSafeString(currentUser?.role).toLowerCase();
+    if (!['pro', 'tipster', 'admin'].includes(normalizedRole)) {
+      return res.status(403).json({ error: 'Solo usuarios Pro/Tipster pueden ver el dashboard financiero' });
+    }
+    const weeklyCuts = await buildTipsterWeeklyCutsSummary(currentUser, { weeks: req.query.weeks });
+    res.json({
+      success: true,
+      tipster: {
+        _id: currentUser._id,
+        name: currentUser.name,
+        role: currentUser.role,
+        bankClabeMasked: toSafeString(currentUser?.bankClabeMasked),
+        bankAccountHolder: toSafeString(currentUser?.bankAccountHolder),
+        bankName: toSafeString(currentUser?.bankName),
+        stripePayoutReady: Boolean(currentUser?.stripePayoutReady),
+        stripePayoutStatus: toSafeString(currentUser?.stripePayoutStatus)
+      },
+      weeklyCuts
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
