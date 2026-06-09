@@ -2936,6 +2936,15 @@ const SOCCER_SCORE_FALLBACK_KEYS = [
 const ODDS_SCORE_LOOKBACK_DAYS = Number.isFinite(Number(process.env.ODDS_SCORE_LOOKBACK_DAYS))
   ? Math.max(1, Math.min(3, Number(process.env.ODDS_SCORE_LOOKBACK_DAYS)))
   : 3;
+const ODDS_API_REGIONS = String(process.env.ODDS_API_REGIONS || 'us')
+  .split(',')
+  .map((region) => String(region || '').trim().toLowerCase())
+  .filter(Boolean)
+  .join(',') || 'us';
+const ODDS_PREFERRED_BOOKMAKERS = String(process.env.ODDS_PREFERRED_BOOKMAKERS || '')
+  .split(',')
+  .map((bookmaker) => String(bookmaker || '').trim())
+  .filter(Boolean);
 
 function toSafeString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -2964,6 +2973,65 @@ function normalizeTeamName(value) {
     .replace(/\b(fc|cf|club|deportivo|the)\b/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeBookmakerToken(value) {
+  return normalizeToken(value).replace(/[^a-z0-9]/g, '');
+}
+
+function parsePreferredBookmakerList(input) {
+  if (Array.isArray(input)) {
+    return Array.from(new Set(input.map((item) => toSafeString(item)).filter(Boolean)));
+  }
+  return Array.from(new Set(
+    String(input || '')
+      .split(',')
+      .map((item) => toSafeString(item))
+      .filter(Boolean)
+  ));
+}
+
+function buildPreferredBookmakerListFromBet(bet) {
+  const ticketBookmaker = toSafeString(bet?.bookmaker);
+  return Array.from(new Set([
+    ...(ticketBookmaker ? [ticketBookmaker] : []),
+    ...ODDS_PREFERRED_BOOKMAKERS
+  ]));
+}
+
+function resolveBookmakerTitle(bookmaker) {
+  return toSafeString(bookmaker?.title || bookmaker?.bookmaker || bookmaker?.key);
+}
+
+function bookmakerMatchesPreference(bookmaker, preference) {
+  const preferenceToken = normalizeBookmakerToken(preference);
+  if (!preferenceToken) return false;
+  const bookmakerTokens = [
+    normalizeBookmakerToken(bookmaker?.key),
+    normalizeBookmakerToken(bookmaker?.title),
+    normalizeBookmakerToken(bookmaker?.bookmaker)
+  ].filter(Boolean);
+  return bookmakerTokens.some((token) =>
+    token === preferenceToken || token.includes(preferenceToken) || preferenceToken.includes(token)
+  );
+}
+
+function filterBookmakersByPreference(bookmakers, preferredBookmakers) {
+  const normalizedBookmakers = Array.isArray(bookmakers) ? bookmakers : [];
+  const preferences = parsePreferredBookmakerList(preferredBookmakers);
+  if (!preferences.length) {
+    return { selectedBookmakers: normalizedBookmakers, usedPreferred: false, matchedPreferences: [] };
+  }
+  const selectedBookmakers = normalizedBookmakers.filter((bookmaker) =>
+    preferences.some((preference) => bookmakerMatchesPreference(bookmaker, preference))
+  );
+  if (!selectedBookmakers.length) {
+    return { selectedBookmakers: normalizedBookmakers, usedPreferred: false, matchedPreferences: [] };
+  }
+  const matchedPreferences = preferences.filter((preference) =>
+    selectedBookmakers.some((bookmaker) => bookmakerMatchesPreference(bookmaker, preference))
+  );
+  return { selectedBookmakers, usedPreferred: true, matchedPreferences };
 }
 
 function splitMatchTeams(match) {
@@ -4358,7 +4426,7 @@ async function fetchOddsEventBoard(sportKey) {
   const cached = readOddsEventBoardCache(cacheKey);
   if (cached) return cached;
   try {
-    const url = `https://api.the-odds-api.com/v4/sports/${normalizedSportKey}/odds?apiKey=${process.env.ODDS_API_KEY}&regions=us&markets=h2h,spreads,totals&oddsFormat=decimal&dateFormat=iso`;
+    const url = `https://api.the-odds-api.com/v4/sports/${normalizedSportKey}/odds?apiKey=${process.env.ODDS_API_KEY}&regions=${encodeURIComponent(ODDS_API_REGIONS)}&markets=h2h,spreads,totals&oddsFormat=decimal&dateFormat=iso`;
     const resp = await axios.get(url, { timeout: 12000 });
     const rows = Array.isArray(resp?.data) ? resp.data : [];
     writeOddsEventBoardCache(cacheKey, rows);
@@ -4387,11 +4455,13 @@ function resolveOddsEventFromBoard(rows, { eventId, home, away }) {
   return bestMatch;
 }
 
-function collectOutcomePricesFromEvent(row, marketKey, matcher) {
+function collectOutcomePricesFromEvent(row, marketKey, matcher, options = {}) {
   const prices = [];
   const normalizedMarketKey = toSafeString(marketKey);
   const bookmakers = Array.isArray(row?.bookmakers) ? row.bookmakers : [];
-  for (const bookmaker of bookmakers) {
+  const preferredBookmakers = parsePreferredBookmakerList(options?.preferredBookmakers);
+  const { selectedBookmakers, usedPreferred, matchedPreferences } = filterBookmakersByPreference(bookmakers, preferredBookmakers);
+  for (const bookmaker of selectedBookmakers) {
     const markets = Array.isArray(bookmaker?.markets) ? bookmaker.markets : [];
     const market = markets.find((item) => toSafeString(item?.key) === normalizedMarketKey);
     if (!market) continue;
@@ -4400,11 +4470,23 @@ function collectOutcomePricesFromEvent(row, marketKey, matcher) {
       const price = toSafeNumber(outcome?.price);
       if (price === null || price <= 1) continue;
       if (!matcher || matcher(outcome)) {
-        prices.push({ price, point: toSafeNumber(outcome?.point), name: toSafeString(outcome?.name) });
+        prices.push({
+          price,
+          point: toSafeNumber(outcome?.point),
+          name: toSafeString(outcome?.name),
+          bookmaker: resolveBookmakerTitle(bookmaker)
+        });
       }
     }
   }
-  return prices;
+  const usedBookmakers = Array.from(new Set(selectedBookmakers.map((bookmaker) => resolveBookmakerTitle(bookmaker)).filter(Boolean)));
+  return {
+    prices,
+    usedPreferred,
+    matchedPreferences,
+    usedBookmakers,
+    preferredBookmakers
+  };
 }
 
 function resolveOddsSignalForMarket({ pick, bet, score }) {
@@ -4480,7 +4562,14 @@ function resolveOddsSignalForMarket({ pick, bet, score }) {
     return signalBase;
   }
 
-  const prices = collectOutcomePricesFromEvent(score?.oddsEvent, oddsMarketKey, matcher);
+  const preferredBookmakers = buildPreferredBookmakerListFromBet(bet);
+  const {
+    prices,
+    usedPreferred,
+    matchedPreferences,
+    usedBookmakers,
+    preferredBookmakers: resolvedPreferredBookmakers
+  } = collectOutcomePricesFromEvent(score?.oddsEvent, oddsMarketKey, matcher, { preferredBookmakers });
   const avgPrice = averageNumbers(prices.map((item) => item.price));
   if (!avgPrice) {
     signalBase.summary = 'No se encontraron momios equivalentes en mercado de cierre.';
@@ -4508,7 +4597,12 @@ function resolveOddsSignalForMarket({ pick, bet, score }) {
   }
   const impliedProbability = avgPrice > 1 ? Number((1 / avgPrice).toFixed(4)) : null;
   const needsReview = alignment === 'mismatch';
-  const summary = `momio mercado ${avgPrice} (${prices.length} fuentes), ticket ${signalBase.ticketOdds ?? 'N/A'}, delta ${delta ?? 'N/A'}, alignment ${alignment}`;
+  const bookmakerScope = usedPreferred
+    ? `bookmaker objetivo (${matchedPreferences.join(', ') || 'coincidencia detectada'})`
+    : resolvedPreferredBookmakers.length
+      ? 'sin match de bookmaker objetivo; usando mercado general'
+      : 'mercado general';
+  const summary = `momio mercado ${avgPrice} (${prices.length} fuentes), ticket ${signalBase.ticketOdds ?? 'N/A'}, delta ${delta ?? 'N/A'}, alignment ${alignment}, ${bookmakerScope}`;
   return {
     ...signalBase,
     available: true,
@@ -4533,7 +4627,12 @@ function resolveOddsSignalForMarket({ pick, bet, score }) {
         impliedProbability,
         ticketOdds: signalBase.ticketOdds,
         ticketVsMarketDelta: delta,
-        alignment
+        alignment,
+        preferredBookmakers: resolvedPreferredBookmakers,
+        matchedPreferredBookmakers: matchedPreferences,
+        usedPreferredBookmakers: usedPreferred,
+        usedBookmakers: usedBookmakers.slice(0, 10),
+        regions: ODDS_API_REGIONS
       }
     }
   };
