@@ -2291,6 +2291,10 @@ app.get('/share/pick/:id', async (req, res) => {
     const frontendBase = (buildFrontendBaseUrl() || 'https://tpz.mx').replace(/\/+$/, '');
     const destinationUrl = `${frontendBase}/?flow=pick&pickId=${encodeURIComponent(String(pick._id))}`;
     const requestOrigin = resolveRequestOrigin(req);
+    const sharePageUrl = requestOrigin
+      ? `${requestOrigin}/share/pick/${encodeURIComponent(String(pick._id))}`
+      : destinationUrl;
+    const isBotRequest = isSocialPreviewBotRequest(req);
     const imageVersion = 'v3';
     const imageUrl = requestOrigin
       ? `${requestOrigin}/share/pick/${encodeURIComponent(String(pick._id))}/og-image.png?v=${imageVersion}`
@@ -2309,7 +2313,7 @@ app.get('/share/pick/:id', async (req, res) => {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(ogTitle)}</title>
-  <link rel="canonical" href="${escapeHtml(destinationUrl)}" />
+  <link rel="canonical" href="${escapeHtml(sharePageUrl)}" />
   <meta name="description" content="${escapeHtml(ogDescription)}" />
   <meta property="og:locale" content="es_MX" />
   <meta property="og:type" content="website" />
@@ -2322,17 +2326,16 @@ app.get('/share/pick/:id', async (req, res) => {
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
   <meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}" />
-  <meta property="og:url" content="${escapeHtml(destinationUrl)}" />
+  <meta property="og:url" content="${escapeHtml(sharePageUrl)}" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:url" content="${escapeHtml(destinationUrl)}" />
+  <meta name="twitter:url" content="${escapeHtml(sharePageUrl)}" />
   <meta name="twitter:title" content="${escapeHtml(ogTitle)}" />
   <meta name="twitter:description" content="${escapeHtml(ogDescription)}" />
   <meta name="twitter:image" content="${escapeHtml(imageUrl)}" />
   <meta name="twitter:image:alt" content="${escapeHtml(ogImageAlt)}" />
-  <meta http-equiv="refresh" content="0; url=${escapeHtml(destinationUrl)}" />
 </head>
 <body>
-  <script>window.location.replace(${JSON.stringify(destinationUrl)});</script>
+  ${isBotRequest ? '' : `<script>setTimeout(function(){ window.location.replace(${JSON.stringify(destinationUrl)}); }, 50);</script>`}
   <p>Redirigiendo a <a href="${escapeHtml(destinationUrl)}">The Pick Zone</a>...</p>
 </body>
 </html>`;
@@ -2622,6 +2625,23 @@ function resolveRequestOrigin(req) {
   const protocol = protocolHeader || req.protocol || 'https';
   const host = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
   return host ? `${protocol}://${host}` : '';
+}
+function isSocialPreviewBotRequest(req) {
+  const userAgent = String(req?.headers?.['user-agent'] || '').toLowerCase();
+  if (!userAgent) return false;
+  const botTokens = [
+    'whatsapp',
+    'facebookexternalhit',
+    'meta-externalagent',
+    'twitterbot',
+    'linkedinbot',
+    'telegrambot',
+    'slackbot',
+    'discordbot',
+    'skypeuripreview',
+    'googlebot'
+  ];
+  return botTokens.some((token) => userAgent.includes(token));
 }
 function formatShareUsdAmount(value) {
   const amount = Number(value);
