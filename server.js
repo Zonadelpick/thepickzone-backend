@@ -2294,7 +2294,6 @@ app.get('/share/pick/:id', async (req, res) => {
     const sharePageUrl = requestOrigin
       ? `${requestOrigin}/share/pick/${encodeURIComponent(String(pick._id))}`
       : destinationUrl;
-    const isBotRequest = isSocialPreviewBotRequest(req);
     const imageVersion = 'v3';
     const imageUrl = requestOrigin
       ? `${requestOrigin}/share/pick/${encodeURIComponent(String(pick._id))}/og-image.png?v=${imageVersion}`
@@ -2335,7 +2334,7 @@ app.get('/share/pick/:id', async (req, res) => {
   <meta name="twitter:image:alt" content="${escapeHtml(ogImageAlt)}" />
 </head>
 <body>
-  ${isBotRequest ? '' : `<script>setTimeout(function(){ window.location.replace(${JSON.stringify(destinationUrl)}); }, 50);</script>`}
+  <script>setTimeout(function(){ window.location.replace(${JSON.stringify(destinationUrl)}); }, 50);</script>
   <p>Redirigiendo a <a href="${escapeHtml(destinationUrl)}">The Pick Zone</a>...</p>
 </body>
 </html>`;
@@ -2625,23 +2624,6 @@ function resolveRequestOrigin(req) {
   const protocol = protocolHeader || req.protocol || 'https';
   const host = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
   return host ? `${protocol}://${host}` : '';
-}
-function isSocialPreviewBotRequest(req) {
-  const userAgent = String(req?.headers?.['user-agent'] || '').toLowerCase();
-  if (!userAgent) return false;
-  const botTokens = [
-    'whatsapp',
-    'facebookexternalhit',
-    'meta-externalagent',
-    'twitterbot',
-    'linkedinbot',
-    'telegrambot',
-    'slackbot',
-    'discordbot',
-    'skypeuripreview',
-    'googlebot'
-  ];
-  return botTokens.some((token) => userAgent.includes(token));
 }
 function formatShareUsdAmount(value) {
   const amount = Number(value);
