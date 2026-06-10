@@ -2291,8 +2291,13 @@ app.get('/share/pick/:id', async (req, res) => {
     const frontendBase = (buildFrontendBaseUrl() || 'https://tpz.mx').replace(/\/+$/, '');
     const destinationUrl = `${frontendBase}/?flow=pick&pickId=${encodeURIComponent(String(pick._id))}`;
     const requestOrigin = resolveRequestOrigin(req);
+    const rawSharePathWithQuery = String(req.originalUrl || req.url || '').trim();
+    const defaultSharePath = `/share/pick/${encodeURIComponent(String(pick._id))}`;
+    const sharePathWithQuery = rawSharePathWithQuery.startsWith('/share/pick/')
+      ? rawSharePathWithQuery
+      : defaultSharePath;
     const sharePageUrl = requestOrigin
-      ? `${requestOrigin}/share/pick/${encodeURIComponent(String(pick._id))}`
+      ? `${requestOrigin}${sharePathWithQuery}`
       : destinationUrl;
     const imageVersion = 'v3';
     const imageUrl = requestOrigin
