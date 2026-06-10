@@ -2344,7 +2344,7 @@ app.get('/share/pick/:id', async (req, res) => {
 </body>
 </html>`;
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('Cache-Control', 'public, max-age=180, stale-while-revalidate=600');
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
     return res.status(200).send(html);
   } catch {
     return res.status(500).send('error');
