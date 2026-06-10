@@ -2824,9 +2824,12 @@ app.get('/api/fixtures/odds', async (req, res) => {
 });
 
 // ── TIPSTERS ─────────────────────────────────────────────────────────────────
+const PUBLIC_TIPSTER_SELECT_FIELDS = '_id name username avatar bio role roi yield roiValue yieldValue netUnits totalRiskedUnits winRate totalPicks wonPicks lostPicks pushPicks avgOdds createdAt';
 app.get('/api/tipsters', async (req, res) => {
   try {
-    const tipsters = await User.find({ role: { $in: ['pro','tipster','admin'] } }).select('-password -proExpiry').sort({ createdAt: -1 });
+    const tipsters = await User.find({ role: { $in: ['pro','tipster','admin'] } })
+      .select(PUBLIC_TIPSTER_SELECT_FIELDS)
+      .sort({ createdAt: -1 });
     res.json(tipsters);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -2836,17 +2839,25 @@ app.get('/api/tipsters/:name/summary', async (req, res) => {
     if (!rawName) return res.status(400).json({ error: 'Nombre de tipster requerido' });
     const decodedName = decodeURIComponent(rawName);
     const escapedName = decodedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const tipsterLookup = { $regex: `^${escapedName}$`, $options: 'i' };
     const tipster = await User.findOne({
       role: { $in: ['pro', 'tipster', 'admin'] },
-      name: { $regex: `^${escapedName}$`, $options: 'i' }
-    }).select('name username avatar bio role roi yield roiValue yieldValue netUnits totalRiskedUnits winRate totalPicks wonPicks lostPicks pushPicks avgOdds');
+      $or: [
+        { name: tipsterLookup },
+        { username: tipsterLookup }
+      ]
+    }).select('_id name username avatar bio role roi yield roiValue yieldValue netUnits totalRiskedUnits winRate totalPicks wonPicks lostPicks pushPicks avgOdds');
     if (!tipster) return res.status(404).json({ error: 'Tipster no encontrado' });
 
     const tipsterName = String(tipster?.name || decodedName).trim();
     const tipsterId = String(tipster?._id || '').trim();
     const viewerUser = await resolveOptionalAuthUser(req);
-    const canViewPrivateDashboard = Boolean(
-      viewerUser && String(viewerUser?._id || '').trim() === tipsterId
+    const viewerRole = toSafeString(viewerUser?.role).toLowerCase();
+    const canViewTipsterFinance = Boolean(
+      viewerUser && (
+        String(viewerUser?._id || '').trim() === tipsterId ||
+        viewerRole === 'admin'
+      )
     );
     const tipsterPickQuery = buildTipsterPickQuery(tipsterId, tipsterName) || { tipster: tipsterName };
     const tipsterPicks = await Pick.find(tipsterPickQuery)
@@ -2890,13 +2901,33 @@ app.get('/api/tipsters/:name/summary', async (req, res) => {
         salesCount: Math.max(0, persistedSales, buyersSales)
       };
     });
-    const weeklyCuts = canViewPrivateDashboard
+    const computedStats = calculateTipsterStatsFromPicks(
+      tipsterPicks.filter((pickDoc) => ['won', 'lost', 'void'].includes(String(pickDoc?.result || '').toLowerCase()))
+    );
+    const tipsterRaw = tipster?.toObject ? tipster.toObject() : tipster;
+    const metricNumberOrFallback = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+    const tipsterPublicMetrics = {
+      ...tipsterRaw,
+      roi: toSafeString(tipsterRaw?.roi) || computedStats.roi,
+      yield: toSafeString(tipsterRaw?.yield) || computedStats.yield,
+      roiValue: metricNumberOrFallback(tipsterRaw?.roiValue, computedStats.roiValue),
+      yieldValue: metricNumberOrFallback(tipsterRaw?.yieldValue, computedStats.yieldValue),
+      netUnits: metricNumberOrFallback(tipsterRaw?.netUnits, computedStats.netUnits),
+      totalRiskedUnits: metricNumberOrFallback(tipsterRaw?.totalRiskedUnits, computedStats.totalRiskedUnits),
+      winRate: metricNumberOrFallback(tipsterRaw?.winRate, computedStats.winRate),
+      totalPicks: metricNumberOrFallback(tipsterRaw?.totalPicks, computedStats.totalPicks),
+      wonPicks: metricNumberOrFallback(tipsterRaw?.wonPicks, computedStats.wonPicks),
+      lostPicks: metricNumberOrFallback(tipsterRaw?.lostPicks, computedStats.lostPicks),
+      pushPicks: metricNumberOrFallback(tipsterRaw?.pushPicks, computedStats.pushPicks),
+      avgOdds: metricNumberOrFallback(tipsterRaw?.avgOdds, computedStats.avgOdds)
+    };
+    const weeklyCuts = canViewTipsterFinance
       ? await buildTipsterWeeklyCutsSummary(tipster, {
           weeks: req.query.weeks,
           tipsterPicks
         })
       : null;
-    const earnings = canViewPrivateDashboard
+    const earnings = canViewTipsterFinance
       ? {
           salesCount: totals.salesCount,
           grossUsd,
@@ -2907,11 +2938,12 @@ app.get('/api/tipsters/:name/summary', async (req, res) => {
 
     res.json({
       success: true,
-      tipster,
+      tipster: tipsterPublicMetrics,
       earnings,
       weeklyCuts,
       history,
-      privateDashboard: canViewPrivateDashboard
+      privateDashboard: canViewTipsterFinance,
+      financeAccess: canViewTipsterFinance
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
