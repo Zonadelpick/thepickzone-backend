@@ -718,6 +718,21 @@ const auth = async (req, res, next) => {
     next();
   } catch(e) { res.status(401).json({ error: 'Invalid token' }); }
 };
+const resolveOptionalAuthUser = async (req) => {
+  const rawAuthHeader = String(req?.headers?.authorization || '').trim();
+  if (!rawAuthHeader) return null;
+  const [scheme, token] = rawAuthHeader.split(' ');
+  if (!/^bearer$/i.test(String(scheme || '')) || !token) return null;
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'thepickzone_secret_2026');
+    const userId = String(decoded?.id || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(userId)) return null;
+    const user = await User.findById(userId).select('_id role name');
+    return user || null;
+  } catch (_) {
+    return null;
+  }
+};
 
 const requireAdmin = (req, res, next) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
@@ -2240,15 +2255,17 @@ app.get('/share/pick/:id/og-image.png', async (req, res) => {
     if (!pickId || !mongoose.Types.ObjectId.isValid(pickId)) return res.status(404).send('not_found');
     const pick = await Pick.findById(pickId).select('match league sport tipster odds price homeLogo awayLogo');
     if (!pick) return res.status(404).send('not_found');
-    if (!Resvg) return res.status(503).send('image_renderer_unavailable');
+    if (!Resvg) {
+      return res.redirect(302, buildShareImageFallbackUrl());
+    }
     const svg = await buildPickShareCardSvg(pick);
     const renderer = new Resvg(svg, { fitTo: { mode: 'width', value: 1200 } });
     const pngBuffer = renderer.render().asPng();
     res.setHeader('Content-Type', 'image/png');
-    res.setHeader('Cache-Control', 'public, max-age=600');
+    res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=86400');
     return res.status(200).send(pngBuffer);
   } catch {
-    return res.status(500).send('error');
+    return res.redirect(302, buildShareImageFallbackUrl());
   }
 });
 app.get('/share/pick/:id/og-image.svg', async (req, res) => {
@@ -2274,9 +2291,10 @@ app.get('/share/pick/:id', async (req, res) => {
     const frontendBase = (buildFrontendBaseUrl() || 'https://tpz.mx').replace(/\/+$/, '');
     const destinationUrl = `${frontendBase}/?flow=pick&pickId=${encodeURIComponent(String(pick._id))}`;
     const requestOrigin = resolveRequestOrigin(req);
+    const imageVersion = 'v3';
     const imageUrl = requestOrigin
-      ? `${requestOrigin}/share/pick/${encodeURIComponent(String(pick._id))}/og-image.png`
-      : `${frontendBase}/logo192.png`;
+      ? `${requestOrigin}/share/pick/${encodeURIComponent(String(pick._id))}/og-image.png?v=${imageVersion}`
+      : buildShareImageFallbackUrl();
     const matchText = String(pick?.match || 'Pick deportivo').trim();
     const tipsterText = String(pick?.tipster || 'Tipster').trim();
     const oddsText = formatShareOdds(pick?.odds);
@@ -2284,26 +2302,33 @@ app.get('/share/pick/:id', async (req, res) => {
     const leagueText = String(pick?.league || pick?.sport || 'The Pick Zone').trim();
     const ogTitle = `${matchText} · Momio ${oddsText} · ${priceText}`;
     const ogDescription = `Pick de ${tipsterText} en ${leagueText}. Costo ${priceText}.`;
+    const ogImageAlt = `Pick de ${tipsterText}: ${matchText} · Momio ${oddsText} · ${priceText}`;
     const html = `<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(ogTitle)}</title>
+  <link rel="canonical" href="${escapeHtml(destinationUrl)}" />
   <meta name="description" content="${escapeHtml(ogDescription)}" />
+  <meta property="og:locale" content="es_MX" />
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="The Pick Zone" />
   <meta property="og:title" content="${escapeHtml(ogTitle)}" />
   <meta property="og:description" content="${escapeHtml(ogDescription)}" />
   <meta property="og:image" content="${escapeHtml(imageUrl)}" />
+  <meta property="og:image:secure_url" content="${escapeHtml(imageUrl)}" />
   <meta property="og:image:type" content="image/png" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}" />
   <meta property="og:url" content="${escapeHtml(destinationUrl)}" />
   <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:url" content="${escapeHtml(destinationUrl)}" />
   <meta name="twitter:title" content="${escapeHtml(ogTitle)}" />
   <meta name="twitter:description" content="${escapeHtml(ogDescription)}" />
   <meta name="twitter:image" content="${escapeHtml(imageUrl)}" />
+  <meta name="twitter:image:alt" content="${escapeHtml(ogImageAlt)}" />
   <meta http-equiv="refresh" content="0; url=${escapeHtml(destinationUrl)}" />
 </head>
 <body>
@@ -2312,7 +2337,7 @@ app.get('/share/pick/:id', async (req, res) => {
 </body>
 </html>`;
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.setHeader('Cache-Control', 'public, max-age=180, stale-while-revalidate=600');
     return res.status(200).send(html);
   } catch {
     return res.status(500).send('error');
@@ -2607,56 +2632,150 @@ function formatShareOdds(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed.toFixed(2) : '--';
 }
-async function fetchImageAsDataUri(imageUrl) {
+const SHARE_IMAGE_DATA_URI_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
+const shareImageDataUriCache = new Map();
+function readShareImageDataUriCache(imageUrl) {
+  const key = String(imageUrl || '').trim();
+  if (!key) return null;
+  const hit = shareImageDataUriCache.get(key);
+  if (!hit) return null;
+  if ((Date.now() - Number(hit.at || 0)) > SHARE_IMAGE_DATA_URI_CACHE_TTL_MS) {
+    shareImageDataUriCache.delete(key);
+    return null;
+  }
+  return typeof hit.value === 'string' ? hit.value : '';
+}
+function writeShareImageDataUriCache(imageUrl, dataUri) {
+  const key = String(imageUrl || '').trim();
+  if (!key) return;
+  shareImageDataUriCache.set(key, { value: String(dataUri || ''), at: Date.now() });
+}
+function truncateShareText(value, maxLength = 52) {
+  const normalized = String(value || '').trim().replace(/\s+/g, ' ');
+  if (!normalized) return '';
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+function buildShareInitials(value, fallback = 'TP') {
+  const normalized = String(value || '').trim();
+  if (!normalized) return fallback;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (!words.length) return fallback;
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return `${words[0][0] || ''}${words[1][0] || ''}`.toUpperCase();
+}
+function buildShareImageFallbackUrl() {
+  const frontendBase = (buildFrontendBaseUrl() || 'https://tpz.mx').replace(/\/+$/, '');
+  return `${frontendBase}/logo512.png`;
+}
+async function fetchImageAsDataUri(imageUrl, options = {}) {
   const safeUrl = String(imageUrl || '').trim();
   if (!safeUrl) return '';
+  const cached = readShareImageDataUriCache(safeUrl);
+  if (cached !== null) return cached;
+  const timeoutMs = Number.isFinite(Number(options?.timeoutMs))
+    ? Math.max(1200, Math.min(9000, Number(options.timeoutMs)))
+    : 3200;
   try {
-    const response = await axios.get(safeUrl, { responseType: 'arraybuffer', timeout: 9000 });
+    const response = await axios.get(safeUrl, { responseType: 'arraybuffer', timeout: timeoutMs });
     const contentType = String(response?.headers?.['content-type'] || '').trim().toLowerCase();
-    if (!contentType.startsWith('image/')) return '';
+    if (!contentType.startsWith('image/')) {
+      writeShareImageDataUriCache(safeUrl, '');
+      return '';
+    }
     const binary = Buffer.from(response.data);
-    if (!binary.length) return '';
-    return `data:${contentType};base64,${binary.toString('base64')}`;
+    if (!binary.length) {
+      writeShareImageDataUriCache(safeUrl, '');
+      return '';
+    }
+    const dataUri = `data:${contentType};base64,${binary.toString('base64')}`;
+    writeShareImageDataUriCache(safeUrl, dataUri);
+    return dataUri;
   } catch {
+    writeShareImageDataUriCache(safeUrl, '');
     return '';
   }
 }
 async function buildPickShareCardSvg(pick) {
   const match = String(pick?.match || 'Pick deportivo').trim();
   const teams = parseMatchTeams(match);
-  const homeTeam = teams.homeTeam || 'Home';
-  const awayTeam = teams.awayTeam || 'Away';
+  const homeTeam = teams.homeTeam || 'Local';
+  const awayTeam = teams.awayTeam || 'Visitante';
+  const typeLabel = String(match || '').toLowerCase().includes('parlay') ? 'PARLAY' : 'STRAIGHT';
   const oddsText = formatShareOdds(pick?.odds);
   const priceText = formatShareUsdAmount(pick?.price);
-  const tipsterText = String(pick?.tipster || 'Tipster').trim();
-  const leagueText = String(pick?.league || pick?.sport || 'The Pick Zone').trim();
+  const numericPrice = Number(pick?.price);
+  const isFreePick = !Number.isFinite(numericPrice) || numericPrice <= 0;
+  const priceLabel = isFreePick ? 'GRATIS' : `${priceText} USD`;
+  const tipsterText = truncateShareText(String(pick?.tipster || 'Tipster').trim(), 28) || 'Tipster';
+  const leagueText = truncateShareText(String(pick?.league || pick?.sport || 'The Pick Zone').trim(), 34) || 'The Pick Zone';
+  const headlineMatch = truncateShareText(match || `${homeTeam} vs ${awayTeam}`, 46) || 'Pick deportivo';
+  const homeInitials = buildShareInitials(homeTeam, 'LO');
+  const awayInitials = buildShareInitials(awayTeam, 'VI');
   const [homeLogoDataUri, awayLogoDataUri] = await Promise.all([
-    fetchImageAsDataUri(pick?.homeLogo),
-    fetchImageAsDataUri(pick?.awayLogo)
+    fetchImageAsDataUri(pick?.homeLogo, { timeoutMs: 2600 }),
+    fetchImageAsDataUri(pick?.awayLogo, { timeoutMs: 2600 })
   ]);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0b0f0e"/>
-      <stop offset="100%" stop-color="#122019"/>
+      <stop offset="0%" stop-color="#080d0b"/>
+      <stop offset="100%" stop-color="#0f2419"/>
     </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f1714"/>
+      <stop offset="100%" stop-color="#121e19"/>
+    </linearGradient>
+    <linearGradient id="pill" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#1DB954"/>
+      <stop offset="100%" stop-color="#14a247"/>
+    </linearGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="18" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
   </defs>
   <rect width="1200" height="630" fill="url(#bg)"/>
-  <rect x="40" y="40" width="1120" height="550" rx="28" fill="#111815" stroke="#1e2d24" stroke-width="3"/>
-  <text x="80" y="110" fill="#1DB954" font-size="40" font-family="Arial, sans-serif" font-weight="700">THE PICK ZONE</text>
-  <text x="80" y="175" fill="#E8F0EC" font-size="48" font-family="Arial, sans-serif" font-weight="700">${escapeXml(homeTeam)} vs ${escapeXml(awayTeam)}</text>
-  <text x="80" y="225" fill="#92A89F" font-size="30" font-family="Arial, sans-serif">${escapeXml(leagueText)}</text>
-  <text x="80" y="295" fill="#E8F0EC" font-size="34" font-family="Arial, sans-serif">Tipster: ${escapeXml(tipsterText)}</text>
-  <rect x="80" y="340" width="310" height="100" rx="18" fill="#0f1410" stroke="#1DB954" stroke-width="2"/>
-  <text x="105" y="388" fill="#92A89F" font-size="26" font-family="Arial, sans-serif">Momio</text>
-  <text x="105" y="426" fill="#E8F0EC" font-size="42" font-family="Arial, sans-serif" font-weight="700">${escapeXml(oddsText)}</text>
-  <rect x="420" y="340" width="310" height="100" rx="18" fill="#0f1410" stroke="#1DB954" stroke-width="2"/>
-  <text x="445" y="388" fill="#92A89F" font-size="26" font-family="Arial, sans-serif">Costo</text>
-  <text x="445" y="426" fill="#E8F0EC" font-size="42" font-family="Arial, sans-serif" font-weight="700">${escapeXml(priceText)}</text>
-  ${homeLogoDataUri ? `<rect x="860" y="170" width="120" height="120" rx="60" fill="#0f1410" stroke="#1e2d24" stroke-width="2"/><image href="${escapeXml(homeLogoDataUri)}" x="870" y="180" width="100" height="100" preserveAspectRatio="xMidYMid meet"/>` : ''}
-  ${awayLogoDataUri ? `<rect x="1010" y="170" width="120" height="120" rx="60" fill="#0f1410" stroke="#1e2d24" stroke-width="2"/><image href="${escapeXml(awayLogoDataUri)}" x="1020" y="180" width="100" height="100" preserveAspectRatio="xMidYMid meet"/>` : ''}
-  <text x="80" y="530" fill="#6B8078" font-size="24" font-family="Arial, sans-serif">Comparte este pick en WhatsApp y redes sociales</text>
+  <circle cx="210" cy="118" r="120" fill="#1DB954" opacity="0.14" filter="url(#softGlow)"/>
+  <circle cx="1050" cy="560" r="180" fill="#F6C94B" opacity="0.1" filter="url(#softGlow)"/>
+  <rect x="34" y="34" width="1132" height="562" rx="34" fill="url(#panel)" stroke="#254236" stroke-width="2"/>
+  <rect x="74" y="72" width="252" height="46" rx="23" fill="url(#pill)"/>
+  <text x="104" y="103" fill="#04150d" font-size="24" font-family="Arial, sans-serif" font-weight="800">THE PICK ZONE</text>
+  <rect x="344" y="72" width="150" height="46" rx="23" fill="#162922" stroke="#2d4a3d" stroke-width="1.5"/>
+  <text x="387" y="103" fill="#E7F0EB" font-size="22" font-family="Arial, sans-serif" font-weight="700">${escapeXml(typeLabel)}</text>
+  <text x="74" y="174" fill="#F2F8F5" font-size="54" font-family="Arial, sans-serif" font-weight="800">${escapeXml(headlineMatch)}</text>
+  <text x="74" y="220" fill="#95AEA4" font-size="30" font-family="Arial, sans-serif">${escapeXml(leagueText)} · Tipster ${escapeXml(tipsterText)}</text>
+
+  <rect x="74" y="252" width="238" height="244" rx="24" fill="#0d1512" stroke="#274338" stroke-width="2"/>
+  <rect x="334" y="252" width="238" height="244" rx="24" fill="#0d1512" stroke="#274338" stroke-width="2"/>
+  <rect x="132" y="290" width="122" height="122" rx="61" fill="#13211b" stroke="#2c4a3d" stroke-width="2"/>
+  <rect x="392" y="290" width="122" height="122" rx="61" fill="#13211b" stroke="#2c4a3d" stroke-width="2"/>
+  ${homeLogoDataUri
+    ? `<image href="${escapeXml(homeLogoDataUri)}" x="143" y="301" width="100" height="100" preserveAspectRatio="xMidYMid meet"/>`
+    : `<text x="173" y="367" fill="#DCE8E2" font-size="42" font-family="Arial, sans-serif" font-weight="800">${escapeXml(homeInitials)}</text>`}
+  ${awayLogoDataUri
+    ? `<image href="${escapeXml(awayLogoDataUri)}" x="403" y="301" width="100" height="100" preserveAspectRatio="xMidYMid meet"/>`
+    : `<text x="433" y="367" fill="#DCE8E2" font-size="42" font-family="Arial, sans-serif" font-weight="800">${escapeXml(awayInitials)}</text>`}
+  <text x="96" y="454" fill="#E7F0EB" font-size="28" font-family="Arial, sans-serif" font-weight="700">${escapeXml(truncateShareText(homeTeam, 18) || homeTeam)}</text>
+  <text x="356" y="454" fill="#E7F0EB" font-size="28" font-family="Arial, sans-serif" font-weight="700">${escapeXml(truncateShareText(awayTeam, 18) || awayTeam)}</text>
+  <text x="186" y="486" fill="#7F9A90" font-size="20" font-family="Arial, sans-serif" text-anchor="middle">LOCAL</text>
+  <text x="446" y="486" fill="#7F9A90" font-size="20" font-family="Arial, sans-serif" text-anchor="middle">VISITANTE</text>
+
+  <rect x="602" y="252" width="230" height="140" rx="22" fill="#0d1512" stroke="#2f5142" stroke-width="2"/>
+  <text x="632" y="300" fill="#8CA59C" font-size="24" font-family="Arial, sans-serif">Momio</text>
+  <text x="632" y="356" fill="#F4F8F6" font-size="58" font-family="Arial, sans-serif" font-weight="800">${escapeXml(oddsText)}</text>
+  <rect x="854" y="252" width="240" height="140" rx="22" fill="#0d1512" stroke="#2f5142" stroke-width="2"/>
+  <text x="884" y="300" fill="#8CA59C" font-size="24" font-family="Arial, sans-serif">Precio</text>
+  <text x="884" y="356" fill="#F6CF58" font-size="${isFreePick ? '52' : '44'}" font-family="Arial, sans-serif" font-weight="800">${escapeXml(priceLabel)}</text>
+
+  <rect x="602" y="414" width="492" height="82" rx="20" fill="#1DB954"/>
+  <text x="632" y="465" fill="#052114" font-size="30" font-family="Arial, sans-serif" font-weight="900">ABRE EL PICK COMPLETO EN TPZ.MX</text>
+  <text x="74" y="546" fill="#738C82" font-size="24" font-family="Arial, sans-serif">Compartir en WhatsApp, X, Instagram y cualquier red social.</text>
+  <text x="74" y="576" fill="#4F6860" font-size="20" font-family="Arial, sans-serif">Preview optimizado para tarjetas OG/Twitter.</text>
 </svg>`;
 }
 app.get('/api/fixtures/sports', async (req, res) => {
@@ -2725,6 +2844,10 @@ app.get('/api/tipsters/:name/summary', async (req, res) => {
 
     const tipsterName = String(tipster?.name || decodedName).trim();
     const tipsterId = String(tipster?._id || '').trim();
+    const viewerUser = await resolveOptionalAuthUser(req);
+    const canViewPrivateDashboard = Boolean(
+      viewerUser && String(viewerUser?._id || '').trim() === tipsterId
+    );
     const tipsterPickQuery = buildTipsterPickQuery(tipsterId, tipsterName) || { tipster: tipsterName };
     const tipsterPicks = await Pick.find(tipsterPickQuery)
       .sort({ createdAt: -1 })
@@ -2767,22 +2890,28 @@ app.get('/api/tipsters/:name/summary', async (req, res) => {
         salesCount: Math.max(0, persistedSales, buyersSales)
       };
     });
-    const weeklyCuts = await buildTipsterWeeklyCutsSummary(tipster, {
-      weeks: req.query.weeks,
-      tipsterPicks
-    });
+    const weeklyCuts = canViewPrivateDashboard
+      ? await buildTipsterWeeklyCutsSummary(tipster, {
+          weeks: req.query.weeks,
+          tipsterPicks
+        })
+      : null;
+    const earnings = canViewPrivateDashboard
+      ? {
+          salesCount: totals.salesCount,
+          grossUsd,
+          payoutUsd,
+          platformFeeUsd
+        }
+      : null;
 
     res.json({
       success: true,
       tipster,
-      earnings: {
-        salesCount: totals.salesCount,
-        grossUsd,
-        payoutUsd,
-        platformFeeUsd
-      },
+      earnings,
       weeklyCuts,
-      history
+      history,
+      privateDashboard: canViewPrivateDashboard
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
